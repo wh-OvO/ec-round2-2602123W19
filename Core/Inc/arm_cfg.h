@@ -169,7 +169,7 @@ extern const arm_joint_cfg_t g_arm_joint[ARM_JOINT_NUM];//头文件外部链接
  *     只有前馈没有 Kp → 会慢慢跑偏（模型不准）
  * ========================================================================== */
 #define ARM_BASE_KP_US_PER_DEG   3.0f     /* 每 1° 误差给多少 µs。先 3.0，抖了就减半 */
-#define ARM_BASE_U_MAX_US        300.0f   /* 输出限幅（µs）。20ms 控制周期下别给太大，会冲过头 */
+#define ARM_BASE_U_MAX_US        50.0f    /* 输出限幅（µs）。**标定中临时 50**，标完改回 300.0f */
 #define ARM_BASE_DEADBAND_DEG    1.5f     /* 死区：误差小于这个就停转，抑制抖和嗡嗡响 */
 
 /* ---- 编码器坐标系：AS5600 装好之后，这两个必须先定下来 -------------------

@@ -62,7 +62,8 @@
 | 28 | 2026-11-13 | `docs/T2_插补增量数值验证.md`、`docs/img/` | 从 `proto_app.c` 逐行复算三档增量，出对照图作为 T2 定量证据 | 是 | 复算脚本 + 与上机曲线形状对照 | `cd2c80e` |
 | 29 | 2026-11-13 | `Core/Src/arm_cfg.c` | J4 夹爪按实物标定改为 0~120° / 1430~1530 µs | 是 | 本人三点实测（0/60/120° → 1430/1480/1530 µs） | `f0d1df8` |
 | 30 | 2026-11-13 | `Core/Src/arm_pid.c`、`Core/Inc/arm_pid.h`、`tests/pid_selftest.c`、`arm_joint.c`、`arm_cfg.h`、`CMakeLists.txt` | **PID 模块**：位置式 PID（P/I/D + 前馈 + 死区 + 抗饱和 + D 低通），接入底座闭环；PC 单元测试 32 条 | 是 | PC 单测 **32/32**；其中 `Ki=Kd=0` 时与旧纯 P 代码**逐位相同**（52806 组）；固件编译 `exit=0` | **未提交**（工作区） |
-| 31 | 2026-11-13 | `Drivers/CMSIS/Lib/`（删除）、`AI.MD`、`README.md` | 按任务书 2.4.2 删除 5 个无源码预编译库（34.1 MB）；补本文件与 README | 是 | 从零全量构建 `exit=0`，FLASH 41096 B / 62.71% 与删除前一致 | **本条** |
+| 31 | 2026-11-13 | `Drivers/CMSIS/Lib/`（删除）、`.gitignore`、`README.md`、`AI.MD` | 按任务书 2.4.2 删除 5 个无源码预编译库（34.1 MB）；补本文件与 README | 是 | 从零全量构建 `exit=0`，FLASH 41096 B / 62.71% 与删除前一致 | `8699455` |
+| 32 | 2026-11-13~14 | `Core/Src/arm_cfg.c`、`Core/Inc/arm_cfg.h`、`docs/AS5600_零点标定_实操.md` | AS5600 零点标定起步：J1 `.kind` 切 `ARM_JOINT_VEL`、`.us_stop` 填 1500、`ARM_BASE_U_MAX_US` 300→50（SIGN 填反时只慢爬不飞车）；新增 5 步标定手册 + 4 类故障表 | 是 | 编译 `exit=0`；**标定本身未上板**，手册待本人照着做 | **本条** |
 
 ---
 
