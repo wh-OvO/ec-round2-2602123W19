@@ -9,6 +9,12 @@ build/
 *.su
 compile_commands.json
 
+# ---- 预编译二进制库：任务书 2.4.2 禁止提交 ----
+# CubeMX 从 CMSIS 包里连带拷进来的 DSP 静态库（.lib/.a，共 34 MB），
+# 本工程从未使用（无 arm_math.h、CMake 不引用），已于 2026-11-13 整体删除。
+# 这里挡住，防止下次 CubeMX 重新生成时又拷回来。
+Drivers/CMSIS/Lib/
+
 # ---- PC 端测试产物（tests/ 下的 gcc 测试程序）----
 tests/*.exe
 tests/*.obj
