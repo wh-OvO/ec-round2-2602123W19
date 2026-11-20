@@ -28,10 +28,26 @@
 
       // 要下载并调试的 ELF。写成字面路径，不依赖 CMake Tools 的"启动目标"设置，
       // 免得换了 preset 就找不到文件。
-      "executable": "${workspaceFolder}/build/Debug/rm_arm.elf",
+      //
+      // ⚠️ 2026-11-17 修正：这里原来写的是 "executable"，那是 **cortex-debug**
+      //    扩展的属性，ST 的 stlinkgdbtarget **不认**。不认也不会报错，只会静默忽略，
+      //    后果是 GDB 里一个符号都没有 —— 断点是空心的、F5 停不下来、变量面板
+      //    永远显示"不可用"、程序计数器显示成 "0x080081a8 in ?? ()"。
+      //    这个扩展要的是 imagesAndSymbols 数组：
+      //        imageFileName  = 要下载到 flash 的镜像
+      //        symbolFileName = 用来读符号表的文件
+      //    两者都指向同一个 .elf 就对了。
+      "imagesAndSymbols": [
+        {
+          "imageFileName": "${workspaceFolder}/build/Debug/rm_arm.elf",
+          "symbolFileName": "${workspaceFolder}/build/Debug/rm_arm.elf"
+        }
+      ],
 
-      // 下载完先停到 main()，而不是一上来就跑飞
-      "runToEntryPoint": "main"
+      // 下载完先停到 main()，而不是一上来就跑飞。
+      // 属性名是 runEntry（默认值就是 "main"，写出来是为了看得见）；
+      // "runToEntryPoint" 同样是 cortex-debug 的写法，这个扩展不认。
+      "runEntry": "main"
     }
   ]
 }

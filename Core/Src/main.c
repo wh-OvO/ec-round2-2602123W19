@@ -407,7 +407,14 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.ClockSpeed = 400000;
+  /* ★ 手写补丁（2026-11-15）：400000 → 100000。
+   *   400kHz(Fast) 对杜邦线太苛刻：线长一过 15~20cm，上升沿就靠 4.7k 上拉
+   *   慢慢爬，边沿不够陡 → 偶发 NACK/总线卡死 → mpu6050 判丢线 → 整臂被锁。
+   *   100kHz(Standard) 是 I²C 的保守档，对线长和上拉宽容得多，采样率 50Hz
+   *   根本用不上 400kHz 的带宽。
+   *   ⚠️ 这一行在 CubeMX 的**生成区**里，重新 GENERATE CODE 会被改回 400000，
+   *      和 STM32F103C8Tx_FLASH.ld 一样属于"每次生成后要手工补"的清单。 */
+  hi2c1.Init.ClockSpeed = 100000;
   hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
   hi2c1.Init.OwnAddress1 = 0;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;

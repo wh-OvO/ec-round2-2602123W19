@@ -223,7 +223,7 @@ static uint8_t configure(void)
   return 1u;
 }
 
-uint8_t mpu6050_init(void)
+uint8_t mpu6050_init(void)/*#这一串变量都什么玩意#*/
 {
   const uint32_t now = HAL_GetTick();
 
