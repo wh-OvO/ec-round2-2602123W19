@@ -91,6 +91,7 @@ add_library(arm_servo STATIC
     Core/Src/arm_pwm.c        # T1: 角度 → 脉宽 → CCR 的换算与输出
     Core/Src/arm_joint.c      # T2: 关节执行层（底座闭环 / 其余三路直通）
     Core/Src/as5600.c         # T2: 底座角度反馈（AS5600 磁编码器）
+    Core/Src/arm_kin.c        # A1: 极坐标逆解（(θ,d,α) → J1/J2/J3）
 )
 # arm_joint.c 的 vel_tick() 会调 arm_pid_step()，所以这个依赖得传出去。
 # ★ 必须写在 add_library(arm_pid ...) 之后：放在前面的话 CMake 会把它当成

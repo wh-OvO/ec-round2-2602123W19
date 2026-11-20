@@ -56,7 +56,31 @@ static void arm_write_ccr(uint8_t joint, uint16_t ccr)
 }
 
 /* ------------------------------------------------------------------------- */
-/* 初始化：四路先给中位，再启动 PWM                                           */
+/* 上电第一拍该给多少 µs                                                      */
+/* ------------------------------------------------------------------------- */
+
+/* ★ 为什么速度型关节不能按 deg_home 反算（2026-11-20 加）：
+ *
+ *   J1 是 360° 连续旋转舵机，**没有"开环角度"这回事** —— `arm_deg_to_us()`
+ *   只是拿标定表对 (deg_min..deg_max) 做线性插值。J1 的 deg_home 现在等于
+ *   deg_min = 2，插值结果就是 us_at_deg_min = **600µs = 满速**。上电第一拍
+ *   给满速，底座会窜一下，等 5ms 后的闭环（vel_tick）才抓得住。
+ *
+ *   速度型关节的正确上电状态是「停转」：给 us_stop，剩下的交给闭环去追
+ *   deg_home。注意 5ms 后 vel_tick() 就会把目标拉到 deg_home，所以"上电
+ *   自动回零"这个行为**没有变**，变的只是第一拍不再满速。 */
+static uint16_t power_on_us(uint8_t j)
+{
+  if (g_arm_joint[j].kind == ARM_JOINT_VEL)
+  {
+    return (g_arm_joint[j].us_stop != 0u) ? g_arm_joint[j].us_stop : SERVO_US_HOME;
+  }
+
+  return arm_deg_to_us(j, (float)g_arm_joint[j].deg_home);
+}
+
+/* ------------------------------------------------------------------------- */
+/* 初始化：四路先给各自的上电脉宽，再启动 PWM                                 */
 /* ------------------------------------------------------------------------- */
 void arm_init(void)
 {
@@ -74,11 +98,13 @@ void arm_init(void)
    *   肉眼看就是"上电抽一下"，带载时还会顶一下工件。
    *
    *   改成：按各自标定表的 deg_home 反算脉宽，**第一拍就是正确的**。
-   *   注意必须放在 HAL_TIM_PWM_Start() 之前 —— 这一步的时序意义没变。 */
+   *   注意必须放在 HAL_TIM_PWM_Start() 之前 —— 这一步的时序意义没变。
+   *
+   * ★★ 2026-11-20 再改：位置型还是按 deg_home 反算，速度型改给 us_stop。
+   *   原因见上面 power_on_us() 的注释（J1 新零位 2° 会反算出 600µs 满速）。 */
   for (j = 0; j < ARM_JOINT_NUM; j++)
   {
-    arm_write_ccr(j/*#语法糖标签#*/,
-                  ARM_PWM_US_TO_CCR(arm_deg_to_us(j, (float)g_arm_joint[j].deg_home)));
+    arm_write_ccr(j/*#语法糖标签#*/, ARM_PWM_US_TO_CCR(power_on_us(j)));
   }
 
   /* 第二步：启动四个通道 */
@@ -87,10 +113,11 @@ void arm_init(void)
     (void)HAL_TIM_PWM_Start(&htim2, s_channel[j]);
   }
 
-  /* 第三步：按标定表的零位再走一遍（有的关节零位不是 1500µs） */
+  /* 第三步：按各自的上电脉宽再走一遍
+   * （位置型 = deg_home 反算；速度型 = us_stop，理由见 power_on_us()） */
   for (j = 0; j < ARM_JOINT_NUM; j++)
   {
-    arm_set_deg(j, (float)g_arm_joint[j].deg_home);
+    arm_set_us(j, power_on_us(j));
   }
 }
 
