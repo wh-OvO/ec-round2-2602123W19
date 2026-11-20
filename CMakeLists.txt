@@ -69,7 +69,19 @@ target_include_directories(proto_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Inc
 )
 
-# ---- 库 2：舵机驱动 --------------------------------------------------------
+# ---- 库 2：PID 控制器 ------------------------------------------------------
+# 2026-11-13 加。arm_pid.c 只 include 自己的头（里面只有 <stdint.h>），
+# 不碰 HAL、不碰 arm_cfg.h、连 <math.h> 都不用 —— 所以它能单独拿到 PC 上
+# 编出来跑单测（tests/pid_selftest.c，32 条）。这正是学长说的"可复用驱动"
+# 的判据：打开 .c 文件看它 include 了谁。
+add_library(arm_pid STATIC
+    Core/Src/arm_pid.c        # 通用位置式 PID（P/I/D + 前馈 + 死区 + 抗饱和 + D 低通）
+)
+target_include_directories(arm_pid PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Inc
+)
+
+# ---- 库 3：舵机驱动 --------------------------------------------------------
 # 对外契约：使用方必须提供一个已初始化的全局 TIM_HandleTypeDef htim2
 # （4 通道 50Hz PWM，由 main.c 定义）。本库只往 CCR 写值，不初始化定时器。
 # 这是"由使用方提供依赖"的静态写法，不是耦合错误 —— 类比 FreeRTOS 要求
@@ -80,6 +92,10 @@ add_library(arm_servo STATIC
     Core/Src/arm_joint.c      # T2: 关节执行层（底座闭环 / 其余三路直通）
     Core/Src/as5600.c         # T2: 底座角度反馈（AS5600 磁编码器）
 )
+# arm_joint.c 的 vel_tick() 会调 arm_pid_step()，所以这个依赖得传出去。
+# ★ 必须写在 add_library(arm_pid ...) 之后：放在前面的话 CMake 会把它当成
+#   一个叫 arm_pid 的外部库名（-larm_pid），到链接阶段才报找不到。
+target_link_libraries(arm_servo PUBLIC arm_pid)
 # 为什么手写下面 5 条 include，而不是 target_link_libraries(arm_servo stm32cubemx)：
 # stm32cubemx 是 INTERFACE 库，除了 include 路径还挂了 target_sources()
 # （main.c / HAL / 启动文件）。一旦 link 进来，那些 .c 会被**再编一遍**
@@ -99,7 +115,7 @@ target_compile_definitions(arm_servo PUBLIC USE_HAL_DRIVER STM32F103xB)
 # 后面那个 -Og 是用 target_compile_options(${CMAKE_PROJECT_NAME}) 挂的，
 # **只作用于 rm_arm 这一个 target**。新加的库不补，就会按 -O0 编 ——
 # 那是当初 62088 B / 94.74%、只剩 3.4 KB 的那一档。
-foreach(_lib proto_core arm_servo)
+foreach(_lib proto_core arm_pid arm_servo)
     target_compile_options(${_lib} PRIVATE
         $<$<CONFIG:Release>:-O2>
         $<$<CONFIG:Debug>:-Og>
@@ -116,6 +132,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 )
 # 已拆成静态库的源文件见上方 add_library()：
 #   proto_core ← proto_frame.c
+#   arm_pid    ← arm_pid.c
 #   arm_servo  ← arm_cfg.c / arm_pwm.c / arm_joint.c / as5600.c
 
 # 任务书 2.2：「优化 Release 配置 -O2」。
@@ -150,6 +167,7 @@ target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
 target_link_libraries(${CMAKE_PROJECT_NAME}
     stm32cubemx
     arm_servo       # 舵机驱动静态库（上方 add_library 定义）
+    arm_pid         # PID 控制器静态库（arm_servo 已经 PUBLIC 依赖它，这里写明更直观）
     proto_core      # 协议编解码静态库（上方 add_library 定义）
 
     # Add user defined libraries
