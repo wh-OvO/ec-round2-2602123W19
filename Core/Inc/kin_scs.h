@@ -1,20 +1,39 @@
 /**
   ******************************************************************************
-  * @file    arm_kin.h
-  * @brief   极坐标逆解：把 (方位角 θ, 斜距 d, 仰角 α) 解成 J1/J2/J3 三个关节角
+  * @file    kin_scs.h
+  * @brief   球坐标逆解：把 (方位角 θ, 斜距 d, 仰角 α) 解成 J1/J2/J3 三个关节角
   *
-  *          任务书只要求"加上运动学解算"，没有规定坐标系。本工程选**极坐标**
+  *          任务书只要求"加上运动学解算"，没有规定坐标系。本工程选**球坐标**
   *          而不是笛卡尔，理由是**能少算两步、且没有奇异点**：
   *
   *            笛卡尔入口 (x, y, z)：
   *                θ = atan2(y, x)          ← 要一次 atan2，且 x=y=0 处无定义
   *                r = √(x² + y²)           ← 要一次开方
   *                d = √(r² + z²)           ← 再开一次
-  *            极坐标入口 (θ, d, α)：
+  *            球坐标入口 (θ, d, α)：
   *                直接用，一次开方都不用。
   *
   *          而且 atan2f 在 newlib 里是 ~1KB 的通用实现（见 mpu6050.c 为什么
   *          自己写 atan 多项式）。少用它，FLASH 就少 1KB。
+  *
+  *          ★ **两个库，各管一套坐标系（用户 2026-11-21 定名并更正）**
+  *
+  *              kin_scs.h / kin_scs.c   ← **S**pherical **C**oordinate **S**ystem（球坐标）
+  *              kin_ccs.h / kin_ccs.c   ← **C**artesian **C**oordinate **S**ystem（笛卡尔）
+  *
+  *            两套**完全独立**：不互相 include、不互相调用、不复用任何内部
+  *            helper 或常量。笛卡尔那套是对照用的，**验收走 SCS 这一套**。
+  *
+  *          ⚠️ **为什么是"球"不是"极"**（用户 16:47 更正）
+  *
+  *               极坐标 polar  (r, θ)        ← 只有 2 个量，是**平面**里的
+  *               球坐标 spherical (r, θ, φ)  ← 3 个量，才是**空间**里的
+  *
+  *            本模块的输入 (斜距 d, 方位角 θ, 仰角 α) 三个量定一个空间点，
+  *            所以是**球坐标**，不是极坐标。第一版按 PCS 命名是错的，
+  *            已整体改成 SCS（`kin_pcs.*` → `kin_scs.*`）。
+  *            ᐧ 只有退化到"某个固定平面里"（比如只看 d 和 α 那两根连杆）
+  *              的那个子问题，才是真正的极坐标 —— 见文件下半部分的推导。
   ******************************************************************************
   * @note    **两根连杆，两个解**
   *
@@ -56,8 +75,8 @@
   ******************************************************************************
   */
 
-#ifndef ARM_KIN_H
-#define ARM_KIN_H
+#ifndef KIN_SCS_H
+#define KIN_SCS_H
 
 #include <stdint.h>
 
@@ -65,13 +84,13 @@
 extern "C" {
 #endif
 
-/* 极坐标目标 */
+/* 球坐标目标 */
 typedef struct
 {
   float theta_deg;      /* 方位角 0~360（负值会被归一化到 0~360） */
   float d_mm;           /* 斜距：肩轴心 → 末端，mm */
   float alpha_deg;      /* 仰角：肩轴水平面 → 末端，向上为正 */
-} arm_kin_polar_t;
+} kin_scs_tgt_t;
 
 /* 解出来的三个关节角（机械坐标系，度） */
 typedef struct
@@ -79,7 +98,7 @@ typedef struct
   float j1_deg;         /* 底座 */
   float j2_deg;         /* 大臂（肩） */
   float j3_deg;         /* 小臂（肘） */
-} arm_kin_joints_t;
+} kin_scs_out_t;
 
 /* ---------------------------------------------------------------------------
  * 接口
@@ -88,10 +107,10 @@ typedef struct
 /**
   * @brief  几何参数填好了没有
   * @retval 1 = 可以解算；0 = ARM_KIN_L1_MM / ARM_KIN_L2_MM 还是 0
-  * @note   没填之前 arm_kin_solve_polar() 一律返回失败，**不会**解出一堆
+  * @note   没填之前 kin_scs_solve() 一律返回失败，**不会**解出一堆
   *         NaN 或者除零。这是"未标定"的显式状态，不是错误。
   */
-uint8_t arm_kin_ready(void);
+uint8_t kin_scs_ready(void);
 
 /**
   * @brief  这个手臂够得到的斜距范围
@@ -100,25 +119,26 @@ uint8_t arm_kin_ready(void);
   * @note   两连杆够得到的只是**一个范围**，不是一个圆 —— 靠近 d_min 时
   *         需要折到很紧，J3 往往已经超程。
   */
-void arm_kin_reach(float *d_min, float *d_max);
+void kin_scs_reach(float *d_min, float *d_max);
 
 /**
-  * @brief  极坐标 → 关节角（elbow-up）
+  * @brief  球坐标 → 关节角（elbow-up）
   * @param  tgt  目标（θ, d, α）
   * @param  out  解出的关节角
   * @retval 1 = 成功；0 = 参数为空 / 未标定 / 够不到
   */
-uint8_t arm_kin_solve_polar(const arm_kin_polar_t *tgt, arm_kin_joints_t *out);
+uint8_t kin_scs_solve(const kin_scs_tgt_t *tgt, kin_scs_out_t *out);
 
 /**
   * @brief  正解：关节角 → 垂直平面内的点（x 水平，z 竖直，都以肩轴为原点）
   * @note   给单测做往返校验用，也方便把"解出来的姿态"算回末端做可视化。
   *         底座角不参与（它只绕 z 轴转，不影响本平面内的 x/z）。
+  *         ⚠️ 想要 3D 的 (x, y, z) 正解，用 kin_ccs.h 里的 kin_ccs_fk()。
   */
-void arm_kin_fk(const arm_kin_joints_t *q, float *x_mm, float *z_mm);
+void kin_scs_fk(const kin_scs_out_t *q, float *x_mm, float *z_mm);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* ARM_KIN_H */
+#endif /* KIN_SCS_H */

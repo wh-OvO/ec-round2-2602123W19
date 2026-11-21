@@ -1,11 +1,11 @@
 /**
   ******************************************************************************
-  * @file    arm_kin.c
-  * @brief   极坐标逆解的实现（推导见 arm_kin.h 文件头）
+  * @file    kin_scs.c
+  * @brief   球坐标逆解的实现（推导见 kin_scs.h 文件头）
   ******************************************************************************
   */
 
-#include "arm_kin.h"
+#include "kin_scs.h"
 #include "arm_cfg.h"
 
 #include <math.h>
@@ -84,7 +84,7 @@ static float norm360(float deg)
  * 接口实现
  * ------------------------------------------------------------------------ */
 
-uint8_t arm_kin_ready(void)
+uint8_t kin_scs_ready(void)
 {
   if ((ARM_KIN_L1_MM > 0.0f) && (ARM_KIN_L2_MM > 0.0f))
   {
@@ -94,7 +94,7 @@ uint8_t arm_kin_ready(void)
   return 0u;
 }
 
-void arm_kin_reach(float *d_min, float *d_max)
+void kin_scs_reach(float *d_min, float *d_max)
 {
   const float l1 = ARM_KIN_L1_MM;
   const float l2 = ARM_KIN_L2_MM;
@@ -111,7 +111,7 @@ void arm_kin_reach(float *d_min, float *d_max)
   }
 }
 
-uint8_t arm_kin_solve_polar(const arm_kin_polar_t *tgt, arm_kin_joints_t *out)
+uint8_t kin_scs_solve(const kin_scs_tgt_t *tgt, kin_scs_out_t *out)
 {
   const float l1 = ARM_KIN_L1_MM;
   const float l2 = ARM_KIN_L2_MM;
@@ -132,7 +132,7 @@ uint8_t arm_kin_solve_polar(const arm_kin_polar_t *tgt, arm_kin_joints_t *out)
   /* ---- ① 参数体检 -------------------------------------------------------
    * 没标定就直接拒绝。宁可"什么都不动"，也不要拿 0 去当连杆长度算出
    * 一堆 NaN 再写进 CCR —— 那会让舵机瞬间冲向某个随机角度。 */
-  if (arm_kin_ready() == 0u)
+  if (kin_scs_ready() == 0u)
   {
     return 0u;
   }
@@ -205,7 +205,7 @@ uint8_t arm_kin_solve_polar(const arm_kin_polar_t *tgt, arm_kin_joints_t *out)
   return 1u;
 }
 
-void arm_kin_fk(const arm_kin_joints_t *q, float *x_mm, float *z_mm)
+void kin_scs_fk(const kin_scs_out_t *q, float *x_mm, float *z_mm)
 {
   float phi1;
   float bend;

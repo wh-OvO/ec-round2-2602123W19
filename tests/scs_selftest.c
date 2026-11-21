@@ -1,7 +1,7 @@
 /**
   ******************************************************************************
   * @file    kin_selftest.c
-  * @brief   arm_kin.c 的 PC 端单元测试（不需要板子，也不需要舵机）
+  * @brief   kin_scs.c 的 PC 端单元测试（不需要板子，也不需要舵机）
   *
   *          编译（在 rm_arm 工程根目录）：
   *
@@ -9,7 +9,7 @@
   *              -Wpedantic -O2 -ffp-contract=off -I Core/Inc ^
   *              -DARM_KIN_L1_MM=150.0f -DARM_KIN_L2_MM=120.0f ^
   *              -DARM_KIN_J2_OFF_DEG=90.0f -DARM_KIN_J3_OFF_DEG=0.0f ^
-  *              tests\kin_selftest.c Core\Src\arm_kin.c -o tests\kin_selftest.exe -lm
+  *              tests\kin_selftest.c Core\Src\kin_scs.c -o tests\kin_selftest.exe -lm
   *
   *          为什么几何参数用 -D 传：arm_cfg.h 里那几个宏真的还是 0（未标定），
   *          而测试要验的是**数学**，不是那几个数。用 -D 覆盖成一组整数值，
@@ -23,7 +23,7 @@
 #include <stdio.h>
 #include <math.h>
 
-#include "arm_kin.h"
+#include "kin_scs.h"
 #include "arm_cfg.h"
 
 /* 测试用的几何参数（和编译命令里的 -D 必须一致） */
@@ -66,8 +66,8 @@ static int near_f(float a, float b, float tol)
   return (d <= tol) ? 1 : 0;
 }
 
-/* 关节角 → 平面点 → 极坐标（测试自己用 atan2，和被测代码无关） */
-static void to_polar(float x, float z, float *d, float *alpha)
+/* 关节角 → 平面点 → 球坐标（测试自己用 atan2，和被测代码无关） */
+static void to_da(float x, float z, float *d, float *alpha)
 {
   *d     = sqrtf((x * x) + (z * z));
   *alpha = atan2f(z, x) * (180.0f / 3.14159265358979f);
@@ -83,19 +83,19 @@ static void test_basic(void)
 
   printf("\n[1] 基本可用性\n");
 
-  check(arm_kin_ready() == 1u, "几何参数已填 ⇒ ready = 1");
+  check(kin_scs_ready() == 1u, "几何参数已填 ⇒ ready = 1");
 
-  arm_kin_reach(&dmin, &dmax);
+  kin_scs_reach(&dmin, &dmax);
   check(near_f(dmin, fabsf(T_L1 - T_L2), 0.01f), "d_min = |L1 − L2| = 30 mm");
   check(near_f(dmax, T_L1 + T_L2, 0.01f),         "d_max = L1 + L2 = 270 mm");
 
-  check(arm_kin_ready() == 1u, "重复调用 ready 不改变状态");
+  check(kin_scs_ready() == 1u, "重复调用 ready 不改变状态");
 }
 
 /* ==========================================================================
- * 第 2 组：极坐标 → 关节 → 正解 → 回到原点
+ * 第 2 组：球坐标 → 关节 → 正解 → 回到原点
  * ========================================================================== */
-static void test_polar_roundtrip(void)
+static void test_scs_roundtrip(void)
 {
   static const float cases[][2] =
   {
@@ -111,12 +111,12 @@ static void test_polar_roundtrip(void)
   int  i;
   int  ok = 1;
 
-  printf("\n[2] 极坐标 → 逆解 → 正解 往返（%d 组）\n", n);
+  printf("\n[2] 球坐标 → 逆解 → 正解 往返（%d 组）\n", n);
 
   for (i = 0; i < n; i++)
   {
-    arm_kin_polar_t  tgt;
-    arm_kin_joints_t q;
+    kin_scs_tgt_t  tgt;
+    kin_scs_out_t q;
     float            x  = 0.0f;
     float            z  = 0.0f;
     float            xw = 0.0f;
@@ -126,18 +126,18 @@ static void test_polar_roundtrip(void)
     tgt.d_mm      = cases[i][0];
     tgt.alpha_deg = cases[i][1];
 
-    if (arm_kin_solve_polar(&tgt, &q) == 0u)
+    if (kin_scs_solve(&tgt, &q) == 0u)
     {
       printf("         d=%.1f α=%.1f 解算失败\n", (double)tgt.d_mm, (double)tgt.alpha_deg);
       ok = 0;
       continue;
     }
 
-    /* 期望的平面点（极坐标直接换回直角坐标，全程不敢用被测代码） */
+    /* 期望的平面点（球坐标直接换回直角坐标，全程不敢用被测代码） */
     xw = tgt.d_mm * cosf(tgt.alpha_deg * (3.14159265358979f / 180.0f));
     zw = tgt.d_mm * sinf(tgt.alpha_deg * (3.14159265358979f / 180.0f));
 
-    arm_kin_fk(&q, &x, &z);
+    kin_scs_fk(&q, &x, &z);
 
     if ((near_f(x, xw, TOL_MM) == 0) || (near_f(z, zw, TOL_MM) == 0))
     {
@@ -148,11 +148,11 @@ static void test_polar_roundtrip(void)
     }
   }
 
-  check(ok, "六组极坐标解算后正解都落回目标点（误差 < 0.25 mm）");
+  check(ok, "六组球坐标解算后正解都落回目标点（误差 < 0.25 mm）");
 }
 
 /* ==========================================================================
- * 第 3 组：任意姿态 → 正解 → 极坐标 → 逆解 → 正解，位置必须一致
+ * 第 3 组：任意姿态 → 正解 → 球坐标 → 逆解 → 正解，位置必须一致
  * ========================================================================== */
 static void test_pose_point(void)
 {
@@ -167,9 +167,9 @@ static void test_pose_point(void)
   {
     for (bend = 0.0f; bend <= 160.0f; bend += 20.0f)
     {
-      arm_kin_joints_t q0;
-      arm_kin_joints_t q1;
-      arm_kin_polar_t  tgt;
+      kin_scs_out_t q0;
+      kin_scs_out_t q1;
+      kin_scs_tgt_t  tgt;
       float x0 = 0.0f;
       float z0 = 0.0f;
       float x1 = 0.0f;
@@ -181,21 +181,21 @@ static void test_pose_point(void)
       q0.j2_deg = T_OFF_J2 + (T_SIGN * phi1);
       q0.j3_deg = T_OFF_J3 + (T_SIGN * bend);
 
-      arm_kin_fk(&q0, &x0, &z0);
-      to_polar(x0, z0, &d, &al);
+      kin_scs_fk(&q0, &x0, &z0);
+      to_da(x0, z0, &d, &al);
 
       tgt.theta_deg = 0.0f;
       tgt.d_mm      = d;
       tgt.alpha_deg = al;
 
-      if (arm_kin_solve_polar(&tgt, &q1) == 0u)
+      if (kin_scs_solve(&tgt, &q1) == 0u)
       {
         printf("         φ1=%.0f bend=%.0f 逆解失败\n", (double)phi1, (double)bend);
         ok = 0;
         continue;
       }
 
-      arm_kin_fk(&q1, &x1, &z1);
+      kin_scs_fk(&q1, &x1, &z1);
       n_test++;
 
       if ((near_f(x1, x0, TOL_MM) == 0) || (near_f(z1, z0, TOL_MM) == 0))
@@ -217,8 +217,8 @@ static void test_pose_point(void)
  * ========================================================================== */
 static void test_elbow_up(void)
 {
-  arm_kin_polar_t  tgt;
-  arm_kin_joints_t q;
+  kin_scs_tgt_t  tgt;
+  kin_scs_out_t q;
   float            phi1;
   int              ok = 1;
   float            al;
@@ -231,7 +231,7 @@ static void test_elbow_up(void)
     tgt.d_mm      = 200.0f;
     tgt.alpha_deg = al;
 
-    if (arm_kin_solve_polar(&tgt, &q) == 0u)
+    if (kin_scs_solve(&tgt, &q) == 0u)
     {
       ok = 0;
       continue;
@@ -256,29 +256,29 @@ static void test_elbow_up(void)
  * ========================================================================== */
 static void test_reject(void)
 {
-  arm_kin_polar_t  tgt;
-  arm_kin_joints_t q;
+  kin_scs_tgt_t  tgt;
+  kin_scs_out_t q;
 
   printf("\n[5] 不可达 / 非法输入必须被拒绝\n");
 
   tgt.theta_deg = 0.0f;  tgt.d_mm = 275.0f;  tgt.alpha_deg = 0.0f;
-  check(arm_kin_solve_polar(&tgt, &q) == 0u, "d = 275 > L1+L2 = 270 ⇒ 拒绝");
+  check(kin_scs_solve(&tgt, &q) == 0u, "d = 275 > L1+L2 = 270 ⇒ 拒绝");
 
   tgt.d_mm = 25.0f;
-  check(arm_kin_solve_polar(&tgt, &q) == 0u, "d = 25 < |L1−L2| = 30 ⇒ 拒绝");
+  check(kin_scs_solve(&tgt, &q) == 0u, "d = 25 < |L1−L2| = 30 ⇒ 拒绝");
 
   tgt.d_mm = 0.0f;
-  check(arm_kin_solve_polar(&tgt, &q) == 0u, "d = 0（会在除法上炸）⇒ 拒绝");
+  check(kin_scs_solve(&tgt, &q) == 0u, "d = 0（会在除法上炸）⇒ 拒绝");
 
   tgt.d_mm = 200.0f;
-  check(arm_kin_solve_polar(&tgt, (arm_kin_joints_t *)0) == 0u, "输出指针为 NULL ⇒ 拒绝");
+  check(kin_scs_solve(&tgt, (kin_scs_out_t *)0) == 0u, "输出指针为 NULL ⇒ 拒绝");
 
   tgt.theta_deg = 0.0f;  tgt.d_mm = 200.0f;  tgt.alpha_deg = NAN;
-  check(arm_kin_solve_polar(&tgt, &q) == 0u, "α = NaN ⇒ 拒绝");
+  check(kin_scs_solve(&tgt, &q) == 0u, "α = NaN ⇒ 拒绝");
 
   /* 边界值必须**接受**：d 正好等于 L1+L2 时两连杆共线 */
   tgt.alpha_deg = 0.0f;  tgt.d_mm = 270.0f;
-  check(arm_kin_solve_polar(&tgt, &q) == 1u, "d 正好 = 270（边界）⇒ 接受");
+  check(kin_scs_solve(&tgt, &q) == 1u, "d 正好 = 270（边界）⇒ 接受");
   check(near_f((q.j3_deg - T_OFF_J3) * T_SIGN, 0.0f, TOL_DEG), "边界上 bend = 0（两连杆共线）");
 }
 
@@ -287,24 +287,24 @@ static void test_reject(void)
  * ========================================================================== */
 static void test_theta(void)
 {
-  arm_kin_polar_t  tgt;
-  arm_kin_joints_t q;
+  kin_scs_tgt_t  tgt;
+  kin_scs_out_t q;
 
   printf("\n[6] 方位角归一化到 [0, 360)\n");
 
   tgt.d_mm = 200.0f;  tgt.alpha_deg = 0.0f;
 
   tgt.theta_deg = -30.0f;
-  check((arm_kin_solve_polar(&tgt, &q) == 1u) && near_f(q.j1_deg, 330.0f, 0.01f), "−30 → 330");
+  check((kin_scs_solve(&tgt, &q) == 1u) && near_f(q.j1_deg, 330.0f, 0.01f), "−30 → 330");
 
   tgt.theta_deg = 390.0f;
-  check((arm_kin_solve_polar(&tgt, &q) == 1u) && near_f(q.j1_deg, 30.0f, 0.01f), "390 → 30");
+  check((kin_scs_solve(&tgt, &q) == 1u) && near_f(q.j1_deg, 30.0f, 0.01f), "390 → 30");
 
   tgt.theta_deg = 360.0f;
-  check((arm_kin_solve_polar(&tgt, &q) == 1u) && near_f(q.j1_deg, 0.0f, 0.01f), "360 → 0（不留在外面）");
+  check((kin_scs_solve(&tgt, &q) == 1u) && near_f(q.j1_deg, 0.0f, 0.01f), "360 → 0（不留在外面）");
 
   tgt.theta_deg = 123.456f;
-  check((arm_kin_solve_polar(&tgt, &q) == 1u) && near_f(q.j1_deg, 123.456f, 0.01f), "区间内原样通过");
+  check((kin_scs_solve(&tgt, &q) == 1u) && near_f(q.j1_deg, 123.456f, 0.01f), "区间内原样通过");
 }
 
 /* ==========================================================================
@@ -312,38 +312,38 @@ static void test_theta(void)
  * ========================================================================== */
 static void test_sanity(void)
 {
-  arm_kin_polar_t  tgt;
-  arm_kin_joints_t q_up;
-  arm_kin_joints_t q_dn;
+  kin_scs_tgt_t  tgt;
+  kin_scs_out_t q_up;
+  kin_scs_out_t q_dn;
 
   printf("\n[7] 几何直觉\n");
 
   /* 同一个距离，目标抬高了，大臂仰角必须跟着变大 */
   tgt.theta_deg = 0.0f;  tgt.d_mm = 200.0f;
   tgt.alpha_deg = -20.0f;
-  (void)arm_kin_solve_polar(&tgt, &q_dn);
+  (void)kin_scs_solve(&tgt, &q_dn);
   tgt.alpha_deg = 20.0f;
-  (void)arm_kin_solve_polar(&tgt, &q_up);
+  (void)kin_scs_solve(&tgt, &q_up);
 
   check(q_up.j2_deg > q_dn.j2_deg, "目标抬高 ⇒ 大臂命令角增大");
 
   /* 距离越远，肘越直（bend 越小） */
   tgt.alpha_deg = 0.0f;
   tgt.d_mm = 200.0f;
-  (void)arm_kin_solve_polar(&tgt, &q_up);
+  (void)kin_scs_solve(&tgt, &q_up);
   tgt.d_mm = 260.0f;
-  (void)arm_kin_solve_polar(&tgt, &q_dn);
+  (void)kin_scs_solve(&tgt, &q_dn);
 
   check(q_dn.j3_deg < q_up.j3_deg, "目标更远 ⇒ 肘弯曲量减小（更接近伸直）");
 
   /* 伸出到极点时 bend 必须为 0 */
   tgt.d_mm = 270.0f;
-  (void)arm_kin_solve_polar(&tgt, &q_up);
+  (void)kin_scs_solve(&tgt, &q_up);
   check(near_f((q_up.j3_deg - T_OFF_J3) * T_SIGN, 0.0f, TOL_DEG), "d = L1+L2 ⇒ bend = 0");
 
   /* 折到极点（d = |L1−L2|）时 bend 必须为 180 */
   tgt.d_mm = 30.0f;
-  (void)arm_kin_solve_polar(&tgt, &q_dn);
+  (void)kin_scs_solve(&tgt, &q_dn);
   check(near_f((q_dn.j3_deg - T_OFF_J3) * T_SIGN, 180.0f, TOL_DEG), "d = |L1−L2| ⇒ bend = 180");
 }
 
@@ -353,12 +353,12 @@ static void test_sanity(void)
 int main(void)
 {
   printf("==========================================================\n");
-  printf(" arm_kin 单元测试  L1=%.0f L2=%.0f OFF_J2=%.0f OFF_J3=%.0f\n",
+  printf(" kin_scs 单元测试  L1=%.0f L2=%.0f OFF_J2=%.0f OFF_J3=%.0f\n",
          (double)T_L1, (double)T_L2, (double)T_OFF_J2, (double)T_OFF_J3);
   printf("==========================================================\n");
 
   test_basic();
-  test_polar_roundtrip();
+  test_scs_roundtrip();
   test_pose_point();
   test_elbow_up();
   test_reject();
