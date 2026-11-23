@@ -85,6 +85,12 @@ typedef struct
   float j2_sign;        /* 只能 +1.0f 或 -1.0f */
   float j3_off_deg;     /* 小臂，同上 */
   float j3_sign;        /* 只能 +1.0f 或 -1.0f */
+  /* 重力下垂（11-23 实测 10° / 20°）。约定和 kin_scs 那边一样：
+   *   j2_sag_deg > 0 ⇔ 大臂实际比名义角低
+   *   j3_sag_deg > 0 ⇔ 小臂实际比名义多折
+   * 填 0 就是"不补偿"。两个库各自持有自己的副本 —— 保持独立。 */
+  float j2_sag_deg;
+  float j3_sag_deg;
 } kin_ccs_cfg_t;
 
 /* 解出来的三个关节角（机械坐标系，度） */

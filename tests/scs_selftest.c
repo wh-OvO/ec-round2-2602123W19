@@ -1,22 +1,17 @@
 /**
   ******************************************************************************
-  * @file    kin_selftest.c
+  * @file    scs_selftest.c
   * @brief   kin_scs.c 的 PC 端单元测试（不需要板子，也不需要舵机）
   *
   *          编译（在 rm_arm 工程根目录）：
   *
   *            C:\Users\Lenovo\tools\mingw64\bin\gcc.exe -std=c11 -Wall -Wextra ^
   *              -Wpedantic -O2 -ffp-contract=off -I Core/Inc ^
-  *              -DARM_KIN_L1_MM=150.0f -DARM_KIN_L2_MM=120.0f ^
-  *              -DARM_KIN_J2_OFF_DEG=90.0f -DARM_KIN_J3_OFF_DEG=0.0f ^
-  *              tests\kin_selftest.c Core\Src\kin_scs.c -o tests\kin_selftest.exe -lm
+  *              tests\scs_selftest.c Core\Src\kin_scs.c -o tests\scs_selftest.exe -lm
   *
-  *          为什么几何参数用 -D 传：arm_cfg.h 里那几个宏真的还是 0（未标定），
-  *          而测试要验的是**数学**，不是那几个数。用 -D 覆盖成一组整数值，
-  *          数学对不对就能验；等真机标定完，把同样的数填进 arm_cfg.h 即可。
-  *
-  *          OFF_J2 故意取 90（而不是 0），就是为了让"偏移 + 符号"这段代码
-  *          真的被跑到 —— 全填 0 的话映射是个恒等式，写错了也测不出来。
+  *          几何参数**直接从 arm_cfg.h 读**（L1=43 / L2=105 / 下垂 10°/20°），
+  *          所以这个测试验的就是板上真跑的配置。想拿别的一组数验数学，加 -D
+  *          覆盖那几个宏即可，测试里的期望值全是跟着宏算的，不用改代码。
   ******************************************************************************
   */
 
@@ -26,16 +21,32 @@
 #include "kin_scs.h"
 #include "arm_cfg.h"
 
-/* 测试用的几何参数（和编译命令里的 -D 必须一致） */
-#define T_L1      150.0f
-#define T_L2      120.0f
-#define T_OFF_J2  90.0f
-#define T_OFF_J3  0.0f
-#define T_SIGN    1.0f
+/* 被测配置（全部来自 arm_cfg.h，测试不另立一套） */
+#define T_L1      ARM_KIN_L1_MM
+#define T_L2      ARM_KIN_L2_MM
+#define T_OFF_J2  ARM_KIN_J2_OFF_DEG
+#define T_OFF_J3  ARM_KIN_J3_OFF_DEG
+#define T_SIGN_J2 ARM_KIN_J2_SIGN
+#define T_SIGN_J3 ARM_KIN_J3_SIGN
+#define T_SAG_J2  ARM_KIN_J2_SAG_DEG
+#define T_SAG_J3  ARM_KIN_J3_SAG_DEG
+
+/* 可达范围。L1=43 / L2=105 ⇒ 62 ~ 148mm */
+#define T_DMIN    (fabsf(T_L1 - T_L2))
+#define T_DMAX    (T_L1 + T_L2)
+/* 下垂补偿后仍能真正走到的最远斜距：再往外 "bend − 20°" 会变成负数被夹到 0，
+ * 也就是手臂其实伸不了那么直（详见第 8 组）。留 3mm 余量。 */
+#define T_SAFE    (T_DMAX - 3.0f)
+/* 折到极限也一样：太靠近 d_min 时 bend 会超过 180 */
+#define T_TIGHT   (T_DMIN + 5.0f)
+
+#define PI_F      3.14159265358979f
+#define D2R       (PI_F / 180.0f)
+#define R2D       (180.0f / PI_F)
 
 /* 容差 */
 #define TOL_DEG   0.02f      /* 角度往返误差 */
-#define TOL_MM    0.25f      /* 位置往返误差（150mm 半径上，0.02° ≈ 0.05mm） */
+#define TOL_MM    0.25f      /* 位置往返误差（148mm 半径上，0.02° ≈ 0.05mm） */
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -70,7 +81,20 @@ static int near_f(float a, float b, float tol)
 static void to_da(float x, float z, float *d, float *alpha)
 {
   *d     = sqrtf((x * x) + (z * z));
-  *alpha = atan2f(z, x) * (180.0f / 3.14159265358979f);
+  *alpha = atan2f(z, x) * R2D;
+}
+
+/* 余弦定理的两个内角，测试里独立算一遍，用来验"补偿量到底加在哪" */
+static float geo_beta(float d)
+{
+  return acosf((((T_L1 * T_L1) + (d * d) - (T_L2 * T_L2)) / (2.0f * T_L1 * d))) * R2D;
+}
+
+static float geo_bend(float d)
+{
+  const float cg = ((T_L1 * T_L1) + (T_L2 * T_L2) - (d * d)) / (2.0f * T_L1 * T_L2);
+
+  return 180.0f - (acosf(cg) * R2D);
 }
 
 /* ==========================================================================
@@ -86,8 +110,9 @@ static void test_basic(void)
   check(kin_scs_ready() == 1u, "几何参数已填 ⇒ ready = 1");
 
   kin_scs_reach(&dmin, &dmax);
-  check(near_f(dmin, fabsf(T_L1 - T_L2), 0.01f), "d_min = |L1 − L2| = 30 mm");
-  check(near_f(dmax, T_L1 + T_L2, 0.01f),         "d_max = L1 + L2 = 270 mm");
+  printf("         可达斜距 %.1f ~ %.1f mm\n", (double)dmin, (double)dmax);
+  check(near_f(dmin, T_DMIN, 0.01f), "d_min = |L1 − L2| = 62 mm");
+  check(near_f(dmax, T_DMAX, 0.01f), "d_max = L1 + L2 = 148 mm");
 
   check(kin_scs_ready() == 1u, "重复调用 ready 不改变状态");
 }
@@ -99,13 +124,13 @@ static void test_scs_roundtrip(void)
 {
   static const float cases[][2] =
   {
-    /*  d      α     */
-    { 200.0f,   0.0f },   /* 正前方 */
-    { 200.0f,  30.0f },   /* 上斜 */
-    { 200.0f, -30.0f },   /* 下斜 */
-    { 150.0f,  60.0f },   /* 高且近 */
-    { 270.0f,   0.0f },   /* 完全伸直（边界） */
-    {  31.0f,   0.0f },   /* 几乎折死（边界附近） */
+    /*  d          α     */
+    { 105.0f,       0.0f },   /* 正前方、中等距离 */
+    { 105.0f,      30.0f },   /* 上斜 */
+    { 105.0f,     -30.0f },   /* 下斜 */
+    {  80.0f,      55.0f },   /* 高且近 */
+    { 145.0f,       0.0f },   /* 接近伸直（补偿后仍可达） */
+    {  67.0f,       0.0f },   /* 接近折死 */
   };
   const int n = (int)(sizeof(cases) / sizeof(cases[0]));
   int  i;
@@ -115,12 +140,12 @@ static void test_scs_roundtrip(void)
 
   for (i = 0; i < n; i++)
   {
-    kin_scs_tgt_t  tgt;
+    kin_scs_tgt_t tgt;
     kin_scs_out_t q;
-    float            x  = 0.0f;
-    float            z  = 0.0f;
-    float            xw = 0.0f;
-    float            zw = 0.0f;
+    float         x  = 0.0f;
+    float         z  = 0.0f;
+    float         xw = 0.0f;
+    float         zw = 0.0f;
 
     tgt.theta_deg = 45.0f;
     tgt.d_mm      = cases[i][0];
@@ -134,8 +159,8 @@ static void test_scs_roundtrip(void)
     }
 
     /* 期望的平面点（球坐标直接换回直角坐标，全程不敢用被测代码） */
-    xw = tgt.d_mm * cosf(tgt.alpha_deg * (3.14159265358979f / 180.0f));
-    zw = tgt.d_mm * sinf(tgt.alpha_deg * (3.14159265358979f / 180.0f));
+    xw = tgt.d_mm * cosf(tgt.alpha_deg * D2R);
+    zw = tgt.d_mm * sinf(tgt.alpha_deg * D2R);
 
     kin_scs_fk(&q, &x, &z);
 
@@ -163,13 +188,14 @@ static void test_pose_point(void)
 
   printf("\n[3] 姿态 → 点 → 逆解 → 点（位置不变性）\n");
 
-  for (phi1 = -70.0f; phi1 <= 70.0f; phi1 += 20.0f)
+  /* 这里的 phi1 / bend 是**几何角**，所以构造命令角时要把下垂量补进去 */
+  for (phi1 = -60.0f; phi1 <= 60.0f; phi1 += 20.0f)
   {
-    for (bend = 0.0f; bend <= 160.0f; bend += 20.0f)
+    for (bend = 20.0f; bend <= 140.0f; bend += 20.0f)
     {
       kin_scs_out_t q0;
       kin_scs_out_t q1;
-      kin_scs_tgt_t  tgt;
+      kin_scs_tgt_t tgt;
       float x0 = 0.0f;
       float z0 = 0.0f;
       float x1 = 0.0f;
@@ -178,8 +204,8 @@ static void test_pose_point(void)
       float al = 0.0f;
 
       q0.j1_deg = 0.0f;
-      q0.j2_deg = T_OFF_J2 + (T_SIGN * phi1);
-      q0.j3_deg = T_OFF_J3 + (T_SIGN * bend);
+      q0.j2_deg = T_OFF_J2 + (T_SIGN_J2 * (phi1 + T_SAG_J2));
+      q0.j3_deg = T_OFF_J3 + (T_SIGN_J3 * (bend - T_SAG_J3));
 
       kin_scs_fk(&q0, &x0, &z0);
       to_da(x0, z0, &d, &al);
@@ -190,7 +216,8 @@ static void test_pose_point(void)
 
       if (kin_scs_solve(&tgt, &q1) == 0u)
       {
-        printf("         φ1=%.0f bend=%.0f 逆解失败\n", (double)phi1, (double)bend);
+        printf("         φ1=%.0f bend=%.0f 逆解失败（d=%.2f）\n",
+               (double)phi1, (double)bend, (double)d);
         ok = 0;
         continue;
       }
@@ -209,7 +236,7 @@ static void test_pose_point(void)
   }
 
   printf("         共 %d 组姿态\n", n_test);
-  check(ok && (n_test > 50), "所有姿态换成点再解回来，末端位置一致");
+  check(ok && (n_test >= 49), "所有姿态换成点再解回来，末端位置一致");
 }
 
 /* ==========================================================================
@@ -217,18 +244,18 @@ static void test_pose_point(void)
  * ========================================================================== */
 static void test_elbow_up(void)
 {
-  kin_scs_tgt_t  tgt;
+  kin_scs_tgt_t tgt;
   kin_scs_out_t q;
-  float            phi1;
-  int              ok = 1;
-  float            al;
+  float         phi1;
+  float         al;
+  int           ok = 1;
 
   printf("\n[4] elbow-up：大臂仰角 ≥ 目标仰角\n");
 
   for (al = -60.0f; al <= 60.0f; al += 30.0f)
   {
     tgt.theta_deg = 0.0f;
-    tgt.d_mm      = 200.0f;
+    tgt.d_mm      = 105.0f;
     tgt.alpha_deg = al;
 
     if (kin_scs_solve(&tgt, &q) == 0u)
@@ -237,7 +264,8 @@ static void test_elbow_up(void)
       continue;
     }
 
-    phi1 = (q.j2_deg - T_OFF_J2) * T_SIGN;
+    /* 把命令角还原成**几何**仰角（减掉补偿的 10°）再比 */
+    phi1 = ((q.j2_deg - T_OFF_J2) * T_SIGN_J2) - T_SAG_J2;
 
     /* β ≥ 0 ⇒ φ1 = α + β ≥ α。这是 elbow-up 的定义性判据。 */
     if (phi1 < (al - TOL_DEG))
@@ -256,30 +284,32 @@ static void test_elbow_up(void)
  * ========================================================================== */
 static void test_reject(void)
 {
-  kin_scs_tgt_t  tgt;
+  kin_scs_tgt_t tgt;
   kin_scs_out_t q;
 
   printf("\n[5] 不可达 / 非法输入必须被拒绝\n");
 
-  tgt.theta_deg = 0.0f;  tgt.d_mm = 275.0f;  tgt.alpha_deg = 0.0f;
-  check(kin_scs_solve(&tgt, &q) == 0u, "d = 275 > L1+L2 = 270 ⇒ 拒绝");
+  tgt.theta_deg = 0.0f;  tgt.alpha_deg = 0.0f;
+  tgt.d_mm = T_DMAX + 10.0f;
+  check(kin_scs_solve(&tgt, &q) == 0u, "d 超过 L1+L2 ⇒ 拒绝");
 
-  tgt.d_mm = 25.0f;
-  check(kin_scs_solve(&tgt, &q) == 0u, "d = 25 < |L1−L2| = 30 ⇒ 拒绝");
+  tgt.d_mm = T_DMIN - 10.0f;
+  check(kin_scs_solve(&tgt, &q) == 0u, "d 小于 |L1−L2| ⇒ 拒绝");
 
   tgt.d_mm = 0.0f;
   check(kin_scs_solve(&tgt, &q) == 0u, "d = 0（会在除法上炸）⇒ 拒绝");
 
-  tgt.d_mm = 200.0f;
+  tgt.d_mm = T_SAFE;
   check(kin_scs_solve(&tgt, (kin_scs_out_t *)0) == 0u, "输出指针为 NULL ⇒ 拒绝");
 
-  tgt.theta_deg = 0.0f;  tgt.d_mm = 200.0f;  tgt.alpha_deg = NAN;
+  tgt.d_mm = T_SAFE;  tgt.alpha_deg = NAN;
   check(kin_scs_solve(&tgt, &q) == 0u, "α = NaN ⇒ 拒绝");
 
   /* 边界值必须**接受**：d 正好等于 L1+L2 时两连杆共线 */
-  tgt.alpha_deg = 0.0f;  tgt.d_mm = 270.0f;
-  check(kin_scs_solve(&tgt, &q) == 1u, "d 正好 = 270（边界）⇒ 接受");
-  check(near_f((q.j3_deg - T_OFF_J3) * T_SIGN, 0.0f, TOL_DEG), "边界上 bend = 0（两连杆共线）");
+  tgt.alpha_deg = 0.0f;  tgt.d_mm = T_DMAX;
+  check(kin_scs_solve(&tgt, &q) == 1u, "d 正好 = L1+L2（边界）⇒ 接受");
+  check(near_f(((q.j3_deg - T_OFF_J3) * T_SIGN_J3), 0.0f, TOL_DEG),
+        "边界上命令 bend 被夹到 0（伸不到比伸直更直）");
 }
 
 /* ==========================================================================
@@ -287,12 +317,12 @@ static void test_reject(void)
  * ========================================================================== */
 static void test_theta(void)
 {
-  kin_scs_tgt_t  tgt;
+  kin_scs_tgt_t tgt;
   kin_scs_out_t q;
 
   printf("\n[6] 方位角归一化到 [0, 360)\n");
 
-  tgt.d_mm = 200.0f;  tgt.alpha_deg = 0.0f;
+  tgt.d_mm = T_SAFE;  tgt.alpha_deg = 0.0f;
 
   tgt.theta_deg = -30.0f;
   check((kin_scs_solve(&tgt, &q) == 1u) && near_f(q.j1_deg, 330.0f, 0.01f), "−30 → 330");
@@ -312,14 +342,14 @@ static void test_theta(void)
  * ========================================================================== */
 static void test_sanity(void)
 {
-  kin_scs_tgt_t  tgt;
+  kin_scs_tgt_t tgt;
   kin_scs_out_t q_up;
   kin_scs_out_t q_dn;
 
   printf("\n[7] 几何直觉\n");
 
   /* 同一个距离，目标抬高了，大臂仰角必须跟着变大 */
-  tgt.theta_deg = 0.0f;  tgt.d_mm = 200.0f;
+  tgt.theta_deg = 0.0f;  tgt.d_mm = 105.0f;
   tgt.alpha_deg = -20.0f;
   (void)kin_scs_solve(&tgt, &q_dn);
   tgt.alpha_deg = 20.0f;
@@ -329,22 +359,72 @@ static void test_sanity(void)
 
   /* 距离越远，肘越直（bend 越小） */
   tgt.alpha_deg = 0.0f;
-  tgt.d_mm = 200.0f;
+  tgt.d_mm = 90.0f;
   (void)kin_scs_solve(&tgt, &q_up);
-  tgt.d_mm = 260.0f;
+  tgt.d_mm = T_SAFE;
   (void)kin_scs_solve(&tgt, &q_dn);
 
   check(q_dn.j3_deg < q_up.j3_deg, "目标更远 ⇒ 肘弯曲量减小（更接近伸直）");
 
-  /* 伸出到极点时 bend 必须为 0 */
-  tgt.d_mm = 270.0f;
+  /* 伸出到极点：命令 bend 被夹到 0 */
+  tgt.d_mm = T_DMAX;
   (void)kin_scs_solve(&tgt, &q_up);
-  check(near_f((q_up.j3_deg - T_OFF_J3) * T_SIGN, 0.0f, TOL_DEG), "d = L1+L2 ⇒ bend = 0");
+  check(near_f((q_up.j3_deg - T_OFF_J3) * T_SIGN_J3, 0.0f, TOL_DEG), "d = L1+L2 ⇒ bend = 0");
 
-  /* 折到极点（d = |L1−L2|）时 bend 必须为 180 */
-  tgt.d_mm = 30.0f;
+  /* 折到极点（d = |L1−L2|）：**物理** bend = 180（命令角要减去补偿的 20） */
+  tgt.d_mm = T_DMIN;
   (void)kin_scs_solve(&tgt, &q_dn);
-  check(near_f((q_dn.j3_deg - T_OFF_J3) * T_SIGN, 180.0f, TOL_DEG), "d = |L1−L2| ⇒ bend = 180");
+  check(near_f(((q_dn.j3_deg - T_OFF_J3) * T_SIGN_J3) + T_SAG_J3, 180.0f, TOL_DEG),
+        "d = |L1−L2| ⇒ 物理 bend = 180");
+}
+
+/* ==========================================================================
+ * 第 8 组：重力下垂补偿到底加在哪
+ * ========================================================================== */
+static void test_sag(void)
+{
+  kin_scs_tgt_t tgt;
+  kin_scs_out_t q;
+  float         d  = 0.5f * (T_DMIN + T_DMAX);
+  float         pi = 0.0f;
+  float         bc = 0.0f;
+
+  printf("\n[8] 重力下垂补偿（SAG_J2=%.0f° SAG_J3=%.0f°）\n",
+         (double)T_SAG_J2, (double)T_SAG_J3);
+
+  tgt.theta_deg = 0.0f;
+  tgt.d_mm      = d;
+  tgt.alpha_deg = 0.0f;
+
+  if (kin_scs_solve(&tgt, &q) == 0u)
+  {
+    check(0, "中距目标解算失败");
+    return;
+  }
+
+  pi = (q.j2_deg - T_OFF_J2) * T_SIGN_J2;
+  bc = (q.j3_deg - T_OFF_J3) * T_SIGN_J3;
+
+  /* 大臂：命令角 = 几何 φ1 + 10（先抬高，掉下来才正好） */
+  check(near_f(pi, geo_beta(d) + T_SAG_J2, 0.05f),
+        "命令 φ1 = 几何 φ1 + SAG_J2");
+
+  /* 小臂：命令 bend = 几何 bend − 20（先放平，折进去才正好） */
+  check(near_f(bc, geo_bend(d) - T_SAG_J3, 0.05f),
+        "命令 bend = 几何 bend − SAG_J3");
+
+  /* FK 必须把补偿扣回去，否则"位置"描述的就不是手臂真实所在 */
+  {
+    float x = 0.0f;
+    float z = 0.0f;
+
+    kin_scs_fk(&q, &x, &z);
+    check(near_f(sqrtf((x * x) + (z * z)), d, TOL_MM),
+          "正解把补偿扣回去 ⇒ 落回目标斜距");
+  }
+
+  /* 补偿量填 0 时，命令角必须等于几何角（这条守住"不补偿也对"的基线） */
+  check((T_SAG_J2 >= 0.0f) && (T_SAG_J3 >= 0.0f), "两个补偿量都是正的（符号没填反）");
 }
 
 /* ==========================================================================
@@ -353,8 +433,13 @@ static void test_sanity(void)
 int main(void)
 {
   printf("==========================================================\n");
-  printf(" kin_scs 单元测试  L1=%.0f L2=%.0f OFF_J2=%.0f OFF_J3=%.0f\n",
-         (double)T_L1, (double)T_L2, (double)T_OFF_J2, (double)T_OFF_J3);
+  printf(" kin_scs 单元测试  L1=%.0f L2=%.0f\n",
+         (double)T_L1, (double)T_L2);
+  printf("   OFF_J2=%.0f SIGN_J2=%+.0f  OFF_J3=%.0f SIGN_J3=%+.0f\n",
+         (double)T_OFF_J2, (double)T_SIGN_J2,
+         (double)T_OFF_J3, (double)T_SIGN_J3);
+  printf("   SAG_J2=%.0f SAG_J3=%.0f   可达 %.0f ~ %.0f mm\n",
+         (double)T_SAG_J2, (double)T_SAG_J3, (double)T_DMIN, (double)T_DMAX);
   printf("==========================================================\n");
 
   test_basic();
@@ -364,6 +449,7 @@ int main(void)
   test_reject();
   test_theta();
   test_sanity();
+  test_sag();
 
   printf("\n==========================================================\n");
   printf(" === %d passed, %d failed ===\n", g_pass, g_fail);

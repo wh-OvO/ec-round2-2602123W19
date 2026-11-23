@@ -36,6 +36,7 @@
 
 #include "main.h"           /* HAL / I2C_HandleTypeDef */
 #include "as5600.h"
+#include <stdio.h>          /* 只为了上电那三行诊断打印，见 as5600_init() */
 
 /* hi2c1 定义在 main.c（CubeMX 生成），这里只声明 */
 extern I2C_HandleTypeDef hi2c1;
@@ -102,7 +103,16 @@ static uint8_t  s_fail_cnt;         /* 连续读角度失败的次数 */
  *
  * 单独抽成函数是因为它有了**两个**调用点：开机初始化、掉线后的定期重探。
  * 两边判据必须一模一样，否则会出现"开机认了、重探不认"的鬼故事。 */
-static uint8_t probe_magnet(void)
+/* 探测，**把两种完全不同的故障分开报**。
+ *
+ *   2 = 芯片应答，MD=1（有磁铁）→ 正常
+ *   1 = 芯片应答，但 MD=0 → 芯片是好的，是**磁铁**太远/偏了/没装
+ *   0 = 芯片根本不应答   → 接线 / 地址 / 供电 / 上拉
+ *
+ * ★ 2026-11-21 为什么要拆：原来只有一个返回值 1/0，把 "MD=0" 和 "芯片没应答"
+ *   都压成 0。现场只看到"iic 又坏了、底座不动"，可这两个的修法完全相反 ——
+ *   一个是拧螺丝挪磁铁，一个是查线。三个值分开之后，上电串口一眼就能看出来。 */
+static uint8_t probe_magnet_ex(void)
 {
   uint8_t status = 0xFFu;
 
@@ -115,7 +125,13 @@ static uint8_t probe_magnet(void)
 
   /* 能读寄存器不等于能测角度：MD=0 说明芯片前面没有磁铁，
    * 这时 ANGLE 寄存器给的是噪声，当成"不在线"处理更安全。 */
-  return (uint8_t)(((status & AS5600_STATUS_MD) != 0u) ? 1u : 0u);
+  return (uint8_t)(((status & AS5600_STATUS_MD) != 0u) ? 2u : 1u);
+}
+
+/* 老接口：只要"能不能用"，不要原因。掉线重探那条路用这个。 */
+static uint8_t probe_magnet(void)
+{
+  return (uint8_t)((probe_magnet_ex() == 2u) ? 1u : 0u);
 }
 #endif
 
@@ -129,7 +145,25 @@ uint8_t as5600_init(void)
   s_last_probe_ms = HAL_GetTick() - AS5600_PROBE_INTERVAL_MS;
 
 #if AS5600_HW_READY
-  s_present = probe_magnet();
+  {
+    const uint8_t r = probe_magnet_ex();
+
+    s_present = (uint8_t)((r == 2u) ? 1u : 0u);
+
+    /* 这三行是"底座不动"的唯一线索，别删。见 probe_magnet_ex() 的注释。 */
+    if (r == 0u)
+    {
+      printf("[T2] AS5600 无应答 (addr 0x36) —— 查接线 / 供电 / 上拉\r\n");
+    }
+    else if (r == 1u)
+    {
+      printf("[T2] AS5600 有应答但 STATUS.MD=0 —— 芯片没坏，是**磁铁**没到位\r\n");
+    }
+    else
+    {
+      printf("[T2] AS5600 在线 (MD=1)\r\n");
+    }
+  }
 #endif
 
   return s_present;

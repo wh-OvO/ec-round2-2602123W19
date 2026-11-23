@@ -238,7 +238,23 @@ uint8_t kin_ccs_solve(float x_mm, float y_mm, float z_mm,
   phi1 = alpha + beta;
   bend = 180.0f - gamma;
 
-  /* ---- ⑤ 几何角 → 舵机命令角 -------------------------------------------
+  /* ---- ⑤ 重力下垂补偿（和 kin_scs 完全同一套约定，各写各的）------------
+   *
+   *   命令 φ1   = 几何 φ1   + SAG_J2      （先抬高，掉下来才正好）
+   *   命令 bend = 几何 bend − SAG_J3      （先放平，折进去才正好）
+   *
+   *   bend 补偿后小于 0 = 这个姿态手臂本来就得伸直，再放平就反向折了，
+   *   机械上做不到，夹到 0。
+   */
+  phi1 += s_cfg.j2_sag_deg;
+  bend -= s_cfg.j3_sag_deg;
+
+  if (bend < 0.0f)
+  {
+    bend = 0.0f;
+  }
+
+  /* ---- ⑥ 几何角 → 舵机命令角 -------------------------------------------
    *
    *      命令角 = OFF + SIGN × 几何角
    */
@@ -268,6 +284,10 @@ void kin_ccs_fk(const kin_ccs_out_t *q,
   /* 命令角 → 几何角。SIGN 是 ±1，所以 1/SIGN == SIGN。 */
   phi1 = (q->j2_deg - s_cfg.j2_off_deg) * s_cfg.j2_sign;
   bend = (q->j3_deg - s_cfg.j3_off_deg) * s_cfg.j3_sign;
+
+  /* 把⑤里补的下垂量扣回去，还原成真实几何姿态（FK 描述的是"手臂实际在哪"）。 */
+  phi1 -= s_cfg.j2_sag_deg;
+  bend += s_cfg.j3_sag_deg;
 
   a1 = phi1 * CART_DEG2RAD;
   a2 = (phi1 - bend) * CART_DEG2RAD;

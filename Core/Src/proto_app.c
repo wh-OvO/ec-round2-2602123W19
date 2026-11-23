@@ -92,6 +92,20 @@ static uint8_t  s_to_hb;                    /* 心跳超时 */
 static float    s_q_from[ARM_JOINT_NUM];    /* 本段起点，单位「度」 */
 static uint16_t s_dur_ms;                   /* 本段总时长，单位 ms */
 static uint32_t s_ms_move0;                 /* 本段开始时刻 */
+
+/* 本拍的时间戳。**整个 proto_app_poll() 调用树只读一次时钟**，
+ * 一律用它，不许再直接调 HAL_GetTick()。
+ *
+ * ★ 为什么非得这样（2026-11-21 修的一个真 bug）：
+ *   move_start() 原来自己现调 HAL_GetTick() 盖 s_ms_move0，而 interp_tick()
+ *   用的是本拍开头缓存的 now。同一拍后半段才调 move_start 的话，
+ *   HAL_GetTick() 已经比 now 大 1~2ms（中间隔着 mpu6050_tick 的 1.46ms I²C），
+ *   于是 t = now - s_ms_move0 变成 **无符号下溢**，得到 42 亿多，
+ *   `t >= s_dur_ms` 立刻成立 → tau 被钳成 1 → **整段 S 曲线一拍跳到终点**。
+ *   表现就是"有时候 S 曲线陡得跟阶跃一样"，而且只在"这一拍刚好采了 MPU
+ *   又刚好插补节拍到期"的时候出现，所以看着像随机。 */
+static uint32_t s_now_ms;                   /* 本拍时间戳，proto_app_poll() 开头写一次 */
+
 static uint8_t  s_moving;                   /* 1 = 正在插补 */
 static uint8_t  s_profile;                  /* 本段速度曲线：PROTO_PROFILE_xxx（见 proto.h 四之一） */
 
@@ -182,36 +196,49 @@ static int16_t to_x10(float deg)
  * ⚠️ 只对 J1（下标 0）。J2/J3/J4 是位置型关节，坐标系没变，绝不能一起加，
  *    否则那三路会整体偏 157°，一上电就撞限位。 */
 
-/* J1 的 CENTER，单位 0.1°。和 arm_joint.c 的 base_read_deg() 用同一个公式。 */
-static int32_t j1_center_x10(void)
-{
-  const int32_t lo = (int32_t)g_arm_joint[0].deg_min;
-  const int32_t hi = (int32_t)g_arm_joint[0].deg_max;
+/* ---- J1 上位机 ←→ 固件 的角度换算 ---------------------------------------
+ *
+ * ★ 2026-11-21 23:10 定案（用户拍板，原话）：
+ *   「-180 -> home; -180~0 -> home~180; 0~180 -> 180~360, 限位到 315 解决一切问题」
+ *
+ *     上位机 −180  →  固件 0    →  机械 home（顶住柱子）
+ *     上位机    0  →  固件 180  →  行程中点
+ *     上位机 +135  →  固件 315  →  撞点，到头
+ *     上位机 +180  →  固件 360  →  被 deg_max = 315 钳住
+ *
+ * 也就是 `固件 = 上位机 + 180`，**纯平移、不缩放** —— 上位机的 1° 就是真 1°。
+ *
+ * 上一版是 `host = fw − CENTER`（CENTER = (2+312)/2 = 157），对齐的是"行程中点 = 0"，
+ * 结果上位机只能到 ±155，+180 被钳成 +155；再上一版更糟，是"按比例铺满"，
+ * 虽然 ±180 都能用到，但显示角比真实角小 13.9% —— 用户一句「按比例映射不如不映射」
+ * 毙掉了。这一版两头都不占：不缩放，home 又正好落在 −180。
+ *
+ * ⚠️ 上位机的 +136~+180 一律钳在 315（行程真的到头了），这是机械决定的，不是 bug。 */
+#define J1_HOST_OFFSET_X10   1800     /* 180.0°，单位 0.1° */
 
-  /* 先乘 10 再除以 2：deg_min + deg_max 是奇数时也精确（比如 2+315 时
-   * CENTER = 158.5° → 1585），不会像"先除后乘"那样被整数除法截掉半度。 */
-  return ((lo + hi) * 10) / 2;
-}
+/* 故障哨兵：arm_joint.c 底座读失败返回 −100°、永久失效 −200°，
+ * 在 0.1° 下是 −1000 / −2000。正常读数下界是 0°，噪声最多到 −5° 左右，
+ * 所以 −500 这个门限分得开。 */
+#define J1_SENTINEL_X10      (-500)
 
 /* 上位机 → 固件。只用在 on_target() 取到原始目标之后、钳位之前。 */
 static int32_t j1_to_fw_x10(uint8_t j, int32_t q)
 {
-  return (j == 0u) ? (q + j1_center_x10()) : q;
+  return (j == 0u) ? (q + J1_HOST_OFFSET_X10) : q;
 }
 
 /* 固件 → 上位机。只用在 send_status() 拼 0x10 的时候。
  *
- * 负数是故障哨兵（底座读失败 −100°、永久失效 −200°），**原样透传** ——
- * 减掉偏移会变成 −261 / −361，上位机就认不出这是"传感器坏了"了。
- * 正常的底座读数下界是 deg_min = 2°（x10 = 20）恒为正，所以不会误伤。 */
+ * 故障哨兵**原样透传** —— 减 180 会变成 −280 / −380，上位机就认不出
+ * "传感器坏了"了，只会当成一个离谱的角度画到图上。 */
 static int16_t j1_to_host_x10(uint8_t j, int16_t q)
 {
-  if ((j != 0u) || (q < 0))
+  if ((j != 0u) || ((int32_t)q < J1_SENTINEL_X10))
   {
     return q;
   }
 
-  return (int16_t)((int32_t)q - j1_center_x10());
+  return (int16_t)((int32_t)q - J1_HOST_OFFSET_X10);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -509,7 +536,7 @@ static void move_start(uint16_t dur_ms, uint8_t profile)
 
   s_profile  = profile;
   s_dur_ms   = dur_ms;
-  s_ms_move0 = HAL_GetTick();
+  s_ms_move0 = s_now_ms;      /* ★ 用本拍的时间戳，不要现调 HAL_GetTick()（见变量注释） */
   s_moving   = 1u;
 }
 
@@ -543,6 +570,15 @@ static void interp_tick(uint32_t now)
   }
 
   t = now - s_ms_move0;
+
+  /* 兜底：同一拍里刚 move_start 就走到这儿，t 本该是 0。
+   * 上面对 s_now_ms 的修法已经让这种情况不会发生了，但无符号相减
+   * 一旦下溢就是 42 亿，代价是把整段轨迹抹平 —— 所以这里再加一道。
+   * 判 (int32_t) 而不是直接比大小：差值超过 2^31 才算"未来"。 */
+  if ((int32_t)t < 0)
+  {
+    t = 0u;
+  }
 
   /* 夹住：不夹的话 tau 会大于 1，角度冲过头，而且 s_moving 永远清不掉 */
   if (t >= (uint32_t)s_dur_ms)
@@ -1007,6 +1043,7 @@ void proto_app_init(void)
   /* 插补器上电就是"停着的"，否则第一拍会莫名其妙走一段 */
   s_dur_ms   = 0u;
   s_ms_move0 = now;
+  s_now_ms   = now;
   s_moving   = 0u;
   s_profile  = PROTO_PROFILE_TRAP;    /* 默认档位；0x20 来了会按载荷里的 profile 覆盖 */
 
@@ -1050,6 +1087,7 @@ void proto_app_poll(void)
   }
 
   now = HAL_GetTick();
+  s_now_ms = now;                      /* ★ 本拍唯一的时间戳，move_start() 也用这个 */
 
   /* 0) T4 传感器：50Hz 采样 + 失联判定。
    *    必须放在收帧之前：这一拍已经判故障的话，刚收到的 0x20 不能再让手臂动。

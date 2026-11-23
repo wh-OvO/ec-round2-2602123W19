@@ -42,6 +42,16 @@ static float wrap180(float a)
  * 场景⑤b 会临时改成 0，用来复现"加这道闸之前"的行为做对照。 */
 static float g_d_max = 1000.0f;
 
+/* 舵机能转多快（°/s）—— 模型里 (u−DB)·K 是**线性**的，没有饱和，
+ * 但这只对 u 小的时候成立：真舵机到 200°/s 左右就上不去了。
+ * 默认 1e9 = 不饱和，这样 ①②③… 那些老场景的结果**逐位不变**；
+ * 硬要改 u_max 的 ⑧ 组会临时设成 200。 */
+static float g_v_max = 1e9f;
+
+/* 输出限幅。arm_cfg.h 的 ARM_BASE_U_MAX_US 现在是 50（标定期的临时值），
+ * ⑧ 组会把它拨到 300 做对照。 */
+static float g_out_max = 50.0f;
+
 /* 一个被控对象实例：位置 + 当前速度 + 上一拍保持的脉宽 */
 typedef struct
 {
@@ -63,6 +73,10 @@ static void plant_step(plant_t *pl, float u_cmd, uint32_t tick)
 
   if      (d >  SERVO_DB_US) { w_tgt =  (d - SERVO_DB_US) * SERVO_K; }
   else if (d < -SERVO_DB_US) { w_tgt =  (d + SERVO_DB_US) * SERVO_K; }
+
+  /* 转速上限。g_v_max = 1e9 时这两行什么都不做（老场景不受影响） */
+  if (w_tgt >  g_v_max) { w_tgt =  g_v_max; }
+  if (w_tgt < -g_v_max) { w_tgt = -g_v_max; }
 
   /* 一阶滞后 */
   const float alpha = SIM_DT_S / (SERVO_TAU_S + SIM_DT_S);
@@ -152,7 +166,7 @@ static void sweep_one(float kp, float ki, float tgt, float start, float secs)
   int   crossed = 0;
 
   p.kp = kp; p.ki = ki; p.kd = 0.0f; p.dt_s = SIM_DT_S;
-  p.out_max = 50.0f; p.i_max = 60.0f; p.deadband = 1.5f; p.d_tau_s = 0.05f;
+  p.out_max = g_out_max; p.i_max = 60.0f; p.deadband = 1.5f; p.d_tau_s = 0.05f;
   p.d_max   = g_d_max;
   arm_pid_reset(&p);
 
@@ -283,6 +297,43 @@ int main(void)
   sweep_one( 3.0f, 1.0f, 90.0f, 0.0f, 20.0f);
   sweep_one( 6.0f, 1.0f, 90.0f, 0.0f, 20.0f);
   sweep_one(10.0f, 1.0f, 90.0f, 0.0f, 20.0f);
+
+  /* ⑧ u_max 从 50 改回 300 —— 50 是标定"怕填错符号飞车"时的临时值。
+   *
+   *    真正的区别不是"更有力"，而是**比例带变宽**：
+   *        比例带 = u_max / Kp  =  50/3 ≈ ±16.7°  →  300/3 = ±100°
+   *    误差 20° 时，u_max=50 已经顶满（bang-bang），u_max=300 才给 60µs。
+   *    所以 50 的时候大角度阶跃根本不是 PID，是开关控制。
+   *
+   *    ★ 必须同时把 v_max 打开：模型里 (u−DB)·K 是线性的，300µs 会算出
+   *      (300−27)×7.83 ≈ 2100°/s 这种不存在的速度。真舵机到 200 就上不去了。 */
+  printf("\n===== ⑧ u_max 50 vs 300（v_max=200 已打开）=====\n");
+  g_v_max = 200.0f;
+
+  printf("\n--- ⑧a 大角度：目标 90°，起点 0°，Ki=1.0（看 u_max 到多大开始过冲）---\n");
+  {
+    static const float um_list[] = { 50.0f, 60.0f, 80.0f, 100.0f, 150.0f, 300.0f };
+    unsigned i;
+
+    for (i = 0u; i < (unsigned)(sizeof(um_list) / sizeof(um_list[0])); i++)
+    {
+      printf("  u_max=%.0f", (double)um_list[i]);
+      g_out_max = um_list[i];
+      sweep_one( 3.0f, 1.0f, 90.0f, 0.0f, 20.0f);
+    }
+  }
+  g_out_max = 300.0f;
+  sweep_one( 3.0f, 0.2f, 90.0f, 0.0f, 20.0f);
+  sweep_one( 3.0f, 2.0f, 90.0f, 0.0f, 20.0f);
+  sweep_one( 3.0f, 4.0f, 90.0f, 0.0f, 20.0f);
+
+  printf("\n--- ⑧b 小角度：目标 0°，起点 +9°（就是现场那 9° 残差）---\n");
+  sweep_one( 3.0f, 0.2f, 0.0f, 9.0f, 20.0f);
+  sweep_one( 3.0f, 1.0f, 0.0f, 9.0f, 20.0f);
+  sweep_one( 3.0f, 2.0f, 0.0f, 9.0f, 20.0f);
+
+  g_out_max = 50.0f;
+  g_v_max   = 1e9f;
 
   return 0;
 }

@@ -74,6 +74,18 @@ static void ccs_cfg_from_macros(kin_ccs_cfg_t *c)
   c->j2_sign    = ARM_KIN_J2_SIGN;
   c->j3_off_deg = ARM_KIN_J3_OFF_DEG;
   c->j3_sign    = ARM_KIN_J3_SIGN;
+  c->j2_sag_deg = ARM_KIN_J2_SAG_DEG;
+  c->j3_sag_deg = ARM_KIN_J3_SAG_DEG;
+}
+
+/* 可达斜距区间（L1=43 / L2=105 ⇒ 62 ~ 148mm），测试点按比例取，
+ * 这样换几何参数不用改测试 */
+#define CCS_DMIN  (fabsf(ARM_KIN_L1_MM - ARM_KIN_L2_MM))
+#define CCS_DMAX  (ARM_KIN_L1_MM + ARM_KIN_L2_MM)
+
+static float d_at(float frac)
+{
+  return CCS_DMIN + (frac * (CCS_DMAX - CCS_DMIN));
 }
 
 /* ------------------------------------------------------------------------- */
@@ -126,11 +138,11 @@ static void test_setup(void)
 static void test_roundtrip(void)
 {
   static const float thetas[] = { 0.0f, 30.0f, 90.0f, 137.5f, 200.0f, 275.0f, 359.0f };
-  static const float ds[]     = { 40.0f, 100.0f, 160.0f, 210.0f, 260.0f };
+  static const float df[]     = { 0.05f, 0.30f, 0.50f, 0.72f, 0.95f };  /* d = d_at(f) */
   static const float alphas[] = { -60.0f, -20.0f, 0.0f, 25.0f, 60.0f };
 
   int nt = (int)(sizeof(thetas) / sizeof(thetas[0]));
-  int nd = (int)(sizeof(ds) / sizeof(ds[0]));
+  int nd = (int)(sizeof(df) / sizeof(df[0]));
   int na = (int)(sizeof(alphas) / sizeof(alphas[0]));
   int i;
   int j;
@@ -148,8 +160,8 @@ static void test_roundtrip(void)
       for (k = 0; k < na; k++)
       {
         const float th = thetas[i] * D2R;
-        const float r0 = ds[j] * cosf(alphas[k] * D2R);
-        const float z0 = ds[j] * sinf(alphas[k] * D2R);
+        const float r0 = d_at(df[j]) * cosf(alphas[k] * D2R);
+        const float z0 = d_at(df[j]) * sinf(alphas[k] * D2R);
         const float x0 = r0 * cosf(th);
         const float y0 = r0 * sinf(th);
 
@@ -257,14 +269,15 @@ static void test_angle(void)
     float phi1;
 
     tgt.theta_deg = 0.0f;
-    tgt.d_mm      = 160.0f;
+    tgt.d_mm      = d_at(0.5f);
     tgt.alpha_deg = 0.0f;
 
     if (kin_scs_solve(&tgt, &up) != 0u)
     {
-      /* 命令角 → 几何角，J2_SIGN 是 ±1，1/SIGN == SIGN */
-      phi1 = (up.j2_deg - ARM_KIN_J2_OFF_DEG) * ARM_KIN_J2_SIGN;
-      bend = (up.j3_deg - ARM_KIN_J3_OFF_DEG) * ARM_KIN_J3_SIGN;
+      /* 命令角 → **几何**角：先按 SIGN 反变换（±1，1/SIGN == SIGN），
+       * 再把④里补的下垂量扣回去 —— 这一步不能省，否则比的是"命令角" */
+      phi1 = ((up.j2_deg - ARM_KIN_J2_OFF_DEG) * ARM_KIN_J2_SIGN) - ARM_KIN_J2_SAG_DEG;
+      bend = ((up.j3_deg - ARM_KIN_J3_OFF_DEG) * ARM_KIN_J3_SIGN) + ARM_KIN_J3_SAG_DEG;
       check(phi1 > tgt.alpha_deg, "elbow-up：φ1 > α（大臂抬到 OP 线上方）");
       check((bend >= 0.0f) && (bend <= 180.0f), "bend 在 [0, 180]");
     }
@@ -281,11 +294,11 @@ static void test_angle(void)
 static void test_compare(void)
 {
   static const float thetas[] = { 0.0f, 30.0f, 90.0f, 137.5f, 200.0f, 275.0f, 359.0f };
-  static const float ds[]     = { 40.0f, 100.0f, 160.0f, 210.0f, 260.0f };
+  static const float df[]     = { 0.05f, 0.30f, 0.50f, 0.72f, 0.95f };  /* d = d_at(f) */
   static const float alphas[] = { -60.0f, -20.0f, 0.0f, 25.0f, 60.0f };
 
   int nt = (int)(sizeof(thetas) / sizeof(thetas[0]));
-  int nd = (int)(sizeof(ds) / sizeof(ds[0]));
+  int nd = (int)(sizeof(df) / sizeof(df[0]));
   int na = (int)(sizeof(alphas) / sizeof(alphas[0]));
   int i;
   int j;
@@ -314,7 +327,7 @@ static void test_compare(void)
         float e;
 
         tgt.theta_deg = thetas[i];
-        tgt.d_mm      = ds[j];
+        tgt.d_mm      = d_at(df[j]);
         tgt.alpha_deg = alphas[k];
 
         if (kin_scs_solve(&tgt, &p) == 0u)
