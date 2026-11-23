@@ -57,8 +57,8 @@ static void cfg_from_macros(kin_ccs_cfg_t *c)
   c->j2_sign    = ARM_KIN_J2_SIGN;
   c->j3_off_deg = ARM_KIN_J3_OFF_DEG;
   c->j3_sign    = ARM_KIN_J3_SIGN;
-  c->j2_tilt_deg = ARM_KIN_J2_TILT_DEG;
-  c->j3_tilt_deg = ARM_KIN_J3_TILT_DEG;
+  c->j2_bias_deg = ARM_KIN_J2_BIAS_DEG;
+  c->j3_bias_deg = ARM_KIN_J3_BIAS_DEG;
 }
 
 /* ---------------------------------------------------------------------------
@@ -239,8 +239,8 @@ static void test_reject(void)
   check("太远（200mm）⇒ 拒绝", kin_ccs_solve(200.0f, 0.0f, 0.0f, &q) == 0u);
   check("太近（30mm）⇒ 拒绝", kin_ccs_solve(30.0f, 0.0f, 0.0f, &q) == 0u);
   check("空指针 ⇒ 拒绝", kin_ccs_solve(100.0f, 0.0f, 0.0f, 0) == 0u);
-  check("器臂正上方 110mm ⇒ 拒绝（仰角超过 90 − TILT_J2）",
-        kin_ccs_solve(0.0f, 0.0f, 110.0f, &q) == 0u);
+  check("器臂正上方 110mm ⇒ 也能解（平面模型没有仰角上限）",
+        kin_ccs_solve(0.0f, 0.0f, 110.0f, &q) == 1u);
 }
 
 /* ---------------------------------------------------------------------------
@@ -291,9 +291,9 @@ int main(void)
   cfg_from_macros(&c);
 
   printf("kin_ccs 单向测试（含与 kin_scs 的对照）\n");
-  printf("  L1=%.1f L2=%.1f  TILT=(%.1f°, %.1f°)\n",
+  printf("  L1=%.1f L2=%.1f  BIAS=(%.1f°, %.1f°)\n",
          (double)c.l1_mm, (double)c.l2_mm,
-         (double)c.j2_tilt_deg, (double)c.j3_tilt_deg);
+         (double)c.j2_bias_deg, (double)c.j3_bias_deg);
 
   test_setup();
   test_agree();

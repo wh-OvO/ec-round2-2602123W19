@@ -25,8 +25,8 @@
 
 #define T_L1    ARM_KIN_L1_MM
 #define T_L2    ARM_KIN_L2_MM
-#define T_TILT2 ARM_KIN_J2_TILT_DEG
-#define T_TILT3 ARM_KIN_J3_TILT_DEG
+#define T_BIAS2 ARM_KIN_J2_BIAS_DEG
+#define T_BIAS3 ARM_KIN_J3_BIAS_DEG
 #define T_OFF2  ARM_KIN_J2_OFF_DEG
 #define T_OFF3  ARM_KIN_J3_OFF_DEG
 #define T_SGN2  ARM_KIN_J2_SIGN
@@ -173,7 +173,8 @@ static void test_law(void)
       continue;
     }
 
-    bend = (q.j3_deg - T_OFF3) * T_SGN3;
+    /* J3 是**命令角**，物理上的连杆夹角还要把偏置加回去 */
+    bend = ((q.j3_deg - T_OFF3) * T_SGN3) + T_BIAS3;
 
     if (near_f(bend, law_bend(ds[i]), 0.05f) == 0)
     {
@@ -313,73 +314,108 @@ static void test_roundtrip(void)
 }
 
 /* ---------------------------------------------------------------------------
- * 第 5 组：两个平面偏斜到底有没有真的进模型
+ * 第 5 组：角度偏置到底有没有真的扣进命令角
+ *
+ *   独立重算一遍几何（不抄 kin_scs.c 的写法）：先用两次余弦定理拿出
+ *   "物理上应该在哪个姿态"，再手算命令角，看 solve 给的一不一样。
  * ------------------------------------------------------------------------ */
-static void test_tilt(void)
+static void test_bias(void)
 {
-  const float s1 = sinf(T_TILT2 * T_D2R);
-  const float c1 = cosf(T_TILT2 * T_D2R);
-  const float s2 = sinf(T_TILT3 * T_D2R);
-
   kin_scs_tgt_t t;
   kin_scs_out_t q;
-  float bend;
-  float cc;
-  float r;
-  float zt;
-  float sn;
-  float expect;
 
-  printf("\n[5] 平面偏斜（TILT_J2=%.1f° TILT_J3=%.1f°）\n",
-         (double)T_TILT2, (double)T_TILT3);
+  const float d = 105.0f;
+  const float al = 0.0f;
+
+  const float cb = ((T_L1 * T_L1) + (d * d) - (T_L2 * T_L2)) / (2.0f * T_L1 * d);
+  const float cg = ((T_L1 * T_L1) + (T_L2 * T_L2) - (d * d)) / (2.0f * T_L1 * T_L2);
+
+  const float phi1_geo = al + (acosf(cb) * T_R2D);
+  const float bend_geo = 180.0f - (acosf(cg) * T_R2D);
+  const float phi1_cmd = phi1_geo + T_BIAS2;
+  const float bend_cmd = bend_geo - T_BIAS3;
+
+  printf("\n[5] 角度偏置（BIAS_J2=%.1f° BIAS_J3=%.1f°）\n",
+         (double)T_BIAS2, (double)T_BIAS3);
 
   t.theta_deg = 30.0f;
-  t.d_mm      = 105.0f;
-  t.alpha_deg = 0.0f;
+  t.d_mm      = d;
+  t.alpha_deg = al;
 
   check("这一组目标可解", kin_scs_solve(&t, &q) == 1u);
 
-  bend = (q.j3_deg - T_OFF3) * T_SGN3;
-  cc   = -(T_L2 * s2 * sinf(bend * T_D2R));
-  r    = t.d_mm * cosf(t.alpha_deg * T_D2R);
-  zt   = t.d_mm * sinf(t.alpha_deg * T_D2R);
-  sn   = (cc + (zt * s1)) / (r * c1);
-  expect = t.theta_deg + (asinf(sn) * T_R2D);
+  printf("         几何：φ1=%.3f° bend=%.3f°  ⇒ 命令：φ1=%.3f° bend=%.3f°\n",
+         (double)phi1_geo, (double)bend_geo, (double)phi1_cmd, (double)bend_cmd);
+  printf("         实际：J2=%.3f° J3=%.3f°\n", (double)q.j2_deg, (double)q.j3_deg);
 
-  printf("         横向偏出 c = %.3f mm ⇒ J1 应为 %.3f°，实际 %.3f°\n",
-         (double)cc, (double)expect, (double)q.j1_deg);
+  check("J2 = 几何仰角 + BIAS_J2",
+        near_f(q.j2_deg, T_OFF2 + (T_SGN2 * phi1_cmd), 0.05f));
+  check("J3 = 几何夹角 − BIAS_J3",
+        near_f(q.j3_deg, T_OFF3 + (T_SGN3 * bend_cmd), 0.05f));
 
-  check("J1 = 目标方位 + asin((c + Z·sinδ2)/(R·cosδ2))",
-        fabsf(q.j1_deg - expect) < 0.05f);
+  /* 正解把偏置扣回去，应该回到目标点 —— 这条同时验了"加"和"减"是互逆的 */
+  {
+    float x;
+    float y;
+    float z;
+    float rr;
 
-  check("偏斜角非零（模型里真的用上了实测 10°/20°）",
-        (fabsf(T_TILT2) > 0.01f) && (fabsf(T_TILT3) > 0.01f));
+    kin_scs_fk(&q, &x, &y, &z);
 
-  check("J1 确实偏离了目标方位（偏斜的必然结果）",
-        fabsf(q.j1_deg - t.theta_deg) > 1.0f);
+    rr = sqrtf((x * x) + (y * y));
+    printf("         正解扣回：(r, z) = (%.4f, %.4f)，目标是 (%.4f, %.4f)\n",
+           (double)rr, (double)z, (double)(d * cosf(al * T_D2R)),
+           (double)(d * sinf(al * T_D2R)));
+
+    check("正解扣回偏置后落回目标点",
+          (fabsf(rr - (d * cosf(al * T_D2R))) < 0.01f) &&
+          (fabsf(z - (d * sinf(al * T_D2R))) < 0.01f));
+  }
+
+  check("偏置非零（模型里真的用上了实测 10°/20°）",
+        (fabsf(T_BIAS2) > 0.01f) && (fabsf(T_BIAS3) > 0.01f));
 }
 
 /* ---------------------------------------------------------------------------
- * 第 6 组：仰角上限 —— 平面歪了以后够不到肩轴正上方
+ * 第 6 组：偏置带来的两个实际限制
+ *   ① 命令角被夹到 0 —— 手臂伸直是靠"命令 0"实现的，但它物理上还弯着
+ *   ② 因此最远够不到 148mm，大概只到 133mm
  * ------------------------------------------------------------------------ */
-static void test_elev_limit(void)
+static void test_bias_limit(void)
 {
   kin_scs_tgt_t t;
   kin_scs_out_t q;
+  float x;
+  float y;
+  float z;
+  float r148;
 
-  printf("\n[6] 仰角上限（理想坐标系里最高只能到 90° − TILT_J2）\n");
+  printf("\n[6] 偏置的实际后果（够不到名义上的 148mm）\n");
 
   t.theta_deg = 0.0f;
+  t.d_mm      = T_DMAX;
+  t.alpha_deg = 90.0f;
+
+  check("d = 148（名义最远）仍可解", kin_scs_solve(&t, &q) == 1u);
+  check("但命令角被夹在 0，不会变成负数", q.j3_deg >= -0.001f);
+
+  /* 命令"竖直伸直"时，物理上两连杆还差 20° 才能共线 —— 所以末端
+   * 不在正上方，而是被顶出去一截。这一条比"距离短了多少"更直观。 */
+  q.j1_deg = 0.0f;
+  q.j3_deg = 0.0f;
+  kin_scs_fk(&q, &x, &y, &z);
+
+  r148 = sqrtf((x * x) + (y * y));
+
+  printf("         命令 j3 = 0 时，末端偏离正上方 %.2f mm，到肩 %.2f mm（名义 148）\n",
+         (double)r148, (double)sqrtf((x * x) + (y * y) + (z * z)));
+
+  check("命令 j3 = 0 时末端明显偏离正上方（≥ 30mm）", r148 > 30.0f);
+
+  /* 平面模型没有"仰角上限"，正上方照样能解 */
   t.d_mm      = 110.0f;
-
   t.alpha_deg = 89.0f;
-  check("α = 89°（几乎正上方）⇒ 拒绝", kin_scs_solve(&t, &q) == 0u);
-
-  t.alpha_deg = 75.0f;
-  check("α = 75° ⇒ 接受", kin_scs_solve(&t, &q) == 1u);
-
-  t.alpha_deg = -60.0f;
-  check("α = −60°（往下够）⇒ 接受", kin_scs_solve(&t, &q) == 1u);
+  check("α = 89°（几乎正上方）⇒ 仍可解", kin_scs_solve(&t, &q) == 1u);
 }
 
 /* ---------------------------------------------------------------------------
@@ -419,16 +455,16 @@ int main(void)
   printf("kin_scs 单向测试\n");
   printf("  L1=%.1f L2=%.1f   可达 %.1f ~ %.1f mm\n",
          (double)T_L1, (double)T_L2, (double)lo, (double)hi);
-  printf("  TILT_J2=%.1f° TILT_J3=%.1f°   OFF=(%.1f, %.1f) SIGN=(%.1f, %.1f)\n",
-         (double)T_TILT2, (double)T_TILT3,
+  printf("  BIAS_J2=%.1f° BIAS_J3=%.1f°   OFF=(%.1f, %.1f) SIGN=(%.1f, %.1f)\n",
+         (double)T_BIAS2, (double)T_BIAS3,
          (double)T_OFF2, (double)T_OFF3, (double)T_SGN2, (double)T_SGN3);
 
   test_setup();
   test_reach();
   test_law();
   test_roundtrip();
-  test_tilt();
-  test_elev_limit();
+  test_bias();
+  test_bias_limit();
   test_mapping();
 
   printf("\n========== %d passed, %d failed ==========\n", g_pass, g_fail);
