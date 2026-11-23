@@ -153,16 +153,26 @@ uint8_t kin_ccs_solve(float x_mm, float y_mm, float z_mm,
   const float l1 = s_cfg.l1_mm;
   const float l2 = s_cfg.l2_mm;
 
+  const float s1 = sinf(s_cfg.j2_tilt_deg * CART_DEG2RAD);
+  const float c1 = cosf(s_cfg.j2_tilt_deg * CART_DEG2RAD);
+  const float s2 = sinf(s_cfg.j3_tilt_deg * CART_DEG2RAD);
+  const float c2 = cosf(s_cfg.j3_tilt_deg * CART_DEG2RAD);
+
   float r;        /* 水平投影：底座轴 → 末端 */
   float d;        /* 斜距：肩轴心 → 末端 */
-  float theta;    /* 方位角 */
-  float alpha;    /* 仰角 */
+  float theta;    /* 方位角（最后会被平面偏斜修正） */
+  float zt;       /* 高度（以肩为零点，向上为正） */
   float cb;
-  float cg;
-  float beta;
-  float gamma;
-  float phi1;
   float bend;
+  float cc;       /* 末端横向偏出摆动平面多少 mm */
+  float lat;      /* cc + zt·s1 */
+  float sn;       /* sin(θ − φ) */
+  float a;        /* 平面内：沿"前方"的分量 */
+  float bt;       /* 平面内：沿"平面自己的上"分量 */
+  float ap;
+  float bp;
+  float psi;
+  float phi1;
 
   if (out == 0)
   {
@@ -198,7 +208,9 @@ uint8_t kin_ccs_solve(float x_mm, float y_mm, float z_mm,
 
   d = sqrtf((r * r) + (z_mm * z_mm));
 
-  alpha = atan2f(z_mm, r) * CART_RAD2DEG;
+  /* 高度直接用 z —— 肩轴心就是原点，不用再算一次仰角。
+   * 球坐标版那边是 z = d·sin(α)，同一个量。 */
+  zt = z_mm;
 
   /* 目标就在肩轴心上：方向无定义，逆解不存在。 */
   if (d < CART_D_EPS)
@@ -217,44 +229,76 @@ uint8_t kin_ccs_solve(float x_mm, float y_mm, float z_mm,
     return 0u;
   }
 
-  /* ---- ③ 余弦定理 -------------------------------------------------------
+  /* ---- ③ 余弦定理直接给 bend ---------------------------------------------
    *
-   *     β（肩处，OP 与大臂夹角）  cos β = (L1² + d² − L2²) / (2·L1·d)
-   *     γ（肘处，两连杆内夹角）    cos γ = (L1² + L2² − d²) / (2·L1·L2)
+   *     d² = L1² + L2² + 2·L1·L2·cos(bend)
    *
-   *   到这里为止，和球坐标版**一模一样** —— 差别全在 ①。
+   *   bend 是**两根连杆之间的夹角**，跟两个摆动平面歪不歪完全无关 ——
+   *   绕连杆自身轴线怎么扭都不改变这个夹角。所以平面偏斜一步都不用进来。
+   *
+   *   到这里为止和球坐标版**一模一样** —— 差别全在 ①。
    */
-  cb = ((l1 * l1) + (d * d) - (l2 * l2)) / (2.0f * l1 * d);
-  cg = ((l1 * l1) + (l2 * l2) - (d * d)) / (2.0f * l1 * l2);
+  cb = ((d * d) - (l1 * l1) - (l2 * l2)) / (2.0f * l1 * l2);
 
-  beta  = acosf(cart_clamp_unit(cb)) * CART_RAD2DEG;
-  gamma = acosf(cart_clamp_unit(cg)) * CART_RAD2DEG;
+  bend = acosf(cart_clamp_unit(cb)) * CART_RAD2DEG;
 
-  /* ---- ④ 取 elbow-up ---------------------------------------------------
+  /* ---- ④ 小臂的横向偏出 -------------------------------------------------
    *
-   *   大臂绝对仰角 φ1 = α + β（加号 = 肘抬到 OP 线上方）
-   *   肘的弯曲量  bend = 180° − γ
+   *   c = −L2 · sin(TILT_J3) · sin(bend)
+   *
+   *   bend = 0 时横偏也是 0（伸直没有"出平面"这回事），弯到 90° 时最大。
+   *   符号约定和 kin_scs.c 的④必须**一模一样**，否则两个库算出来的末端
+   *   会镜像对称，对比就白做了。
    */
-  phi1 = alpha + beta;
-  bend = 180.0f - gamma;
+  cc = -(l2 * s2 * sinf(bend * CART_DEG2RAD));
 
-  /* ---- ⑤ 重力下垂补偿（和 kin_scs 完全同一套约定，各写各的）------------
+  /* ---- ⑤ 底座补转 -------------------------------------------------------
    *
-   *   命令 φ1   = 几何 φ1   + SAG_J2      （先抬高，掉下来才正好）
-   *   命令 bend = 几何 bend − SAG_J3      （先放平，折进去才正好）
+   *     sin(θ − φ) = ( c + Z·sin(TILT_J2) ) / ( R·cos(TILT_J2) )
    *
-   *   bend 补偿后小于 0 = 这个姿态手臂本来就得伸直，再放平就反向折了，
-   *   机械上做不到，夹到 0。
+   *   R 是目标的水平半径、Z 是高度。右端超出 ±1 就是"这套几何根本到不了"。
    */
-  phi1 += s_cfg.j2_sag_deg;
-  bend -= s_cfg.j3_sag_deg;
+  lat = cc + (zt * s1);
 
-  if (bend < 0.0f)
+  if (r < CART_D_EPS)
   {
-    bend = 0.0f;
+    if ((lat > CART_D_EPS) || (lat < -CART_D_EPS))
+    {
+      return 0u;
+    }
+
+    a = 0.0f;
+  }
+  else
+  {
+    sn = lat / (r * c1);
+
+    if ((sn > 1.0f) || (sn < -1.0f))
+    {
+      return 0u;
+    }
+
+    theta += asinf(sn) * CART_RAD2DEG;
+
+    a = r * sqrtf(1.0f - (sn * sn));
   }
 
-  /* ---- ⑥ 几何角 → 舵机命令角 -------------------------------------------
+  bt = (zt + (cc * s1)) / c1;
+
+  /* ---- ⑥ 平面内两连杆 → 大臂仰角 ---------------------------------------
+   *
+   *   A = L1 + L2·cos(bend)           沿大臂方向
+   *   B = L2·sin(bend)·cos(TILT_J3)   垂直大臂方向（只剩落在平面里的那部分）
+   *
+   *   φ1 = atan2(bt, a) + atan2(B, A)    ← 加号 = elbow-up
+   */
+  ap  = l1 + (l2 * cosf(bend * CART_DEG2RAD));
+  bp  = l2 * sinf(bend * CART_DEG2RAD) * c2;
+  psi = atan2f(bp, ap) * CART_RAD2DEG;
+
+  phi1 = (atan2f(bt, a) * CART_RAD2DEG) + psi;
+
+  /* ---- ⑦ 几何角 → 舵机命令角 -------------------------------------------
    *
    *      命令角 = OFF + SIGN × 几何角
    */
@@ -268,13 +312,22 @@ uint8_t kin_ccs_solve(float x_mm, float y_mm, float z_mm,
 void kin_ccs_fk(const kin_ccs_out_t *q,
                      float *x_mm, float *y_mm, float *z_mm)
 {
+  const float s1 = sinf(s_cfg.j2_tilt_deg * CART_DEG2RAD);
+  const float c1 = cosf(s_cfg.j2_tilt_deg * CART_DEG2RAD);
+  const float s2 = sinf(s_cfg.j3_tilt_deg * CART_DEG2RAD);
+  const float c2 = cosf(s_cfg.j3_tilt_deg * CART_DEG2RAD);
+
   float phi1;
   float bend;
-  float r;
-  float z;
-  float a1;
-  float a2;
-  float th;
+  float theta;
+  float ap;
+  float bp;
+  float cp;
+  float a;
+  float bt;
+  float c;
+  float u;
+  float p1;
 
   if ((q == 0) || (x_mm == 0) || (y_mm == 0) || (z_mm == 0))
   {
@@ -282,23 +335,25 @@ void kin_ccs_fk(const kin_ccs_out_t *q,
   }
 
   /* 命令角 → 几何角。SIGN 是 ±1，所以 1/SIGN == SIGN。 */
-  phi1 = (q->j2_deg - s_cfg.j2_off_deg) * s_cfg.j2_sign;
-  bend = (q->j3_deg - s_cfg.j3_off_deg) * s_cfg.j3_sign;
+  phi1  = (q->j2_deg - s_cfg.j2_off_deg) * s_cfg.j2_sign;
+  bend  = (q->j3_deg - s_cfg.j3_off_deg) * s_cfg.j3_sign;
+  theta = q->j1_deg * CART_DEG2RAD;
 
-  /* 把⑤里补的下垂量扣回去，还原成真实几何姿态（FK 描述的是"手臂实际在哪"）。 */
-  phi1 -= s_cfg.j2_sag_deg;
-  bend += s_cfg.j3_sag_deg;
+  /* 平面内两连杆合成一个矢量，再拆成 (沿大臂, 垂直大臂, 出平面) */
+  ap = s_cfg.l1_mm + (s_cfg.l2_mm * cosf(bend * CART_DEG2RAD));
+  bp = s_cfg.l2_mm * sinf(bend * CART_DEG2RAD) * c2;
+  cp = s_cfg.l2_mm * sinf(bend * CART_DEG2RAD) * s2;
 
-  a1 = phi1 * CART_DEG2RAD;
-  a2 = (phi1 - bend) * CART_DEG2RAD;
+  /* 转到"这个摆动平面"的坐标里：(a 前, bt 上, c 法向) */
+  p1 = phi1 * CART_DEG2RAD;
+  a  = (ap * cosf(p1)) + (bp * sinf(p1));
+  bt = (ap * sinf(p1)) - (bp * cosf(p1));
+  c  = -cp;
 
-  r = (s_cfg.l1_mm * cosf(a1)) + (s_cfg.l2_mm * cosf(a2));
-  z = (s_cfg.l1_mm * sinf(a1)) + (s_cfg.l2_mm * sinf(a2));
+  /* 再转回世界坐标（基向量同 kin_scs_fk，两边必须完全一致） */
+  u = (bt * s1) + (c * c1);
 
-  /* 平面 (r, z) 绕 z 轴转回 3D —— 入口是 3D，出口也对称地给 3D。 */
-  th = q->j1_deg * CART_DEG2RAD;
-
-  *x_mm = r * cosf(th);
-  *y_mm = r * sinf(th);
-  *z_mm = z;
+  *x_mm = (a * cosf(theta)) + (u * sinf(theta));
+  *y_mm = (a * sinf(theta)) - (u * cosf(theta));
+  *z_mm = (bt * c1) - (c * s1);
 }

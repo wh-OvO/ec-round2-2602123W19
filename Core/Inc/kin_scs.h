@@ -130,12 +130,18 @@ void kin_scs_reach(float *d_min, float *d_max);
 uint8_t kin_scs_solve(const kin_scs_tgt_t *tgt, kin_scs_out_t *out);
 
 /**
-  * @brief  正解：关节角 → 垂直平面内的点（x 水平，z 竖直，都以肩轴为原点）
+  * @brief  正解：关节角 → 3D 点（原点 = 肩轴心，x 向前、y 向左、z 向上）
   * @note   给单测做往返校验用，也方便把"解出来的姿态"算回末端做可视化。
-  *         底座角不参与（它只绕 z 轴转，不影响本平面内的 x/z）。
-  *         ⚠️ 想要 3D 的 (x, y, z) 正解，用 kin_ccs.h 里的 kin_ccs_fk()。
+  *
+  *   ⚠️ 出的是 **三个分量**，不是平面 (x, z)。原因：两个摆动平面各自歪了
+  *      一个角度（见 arm_cfg.h 的 TILT_J2 / TILT_J3），末端**根本不在**
+  *      底座转轴所在的那个竖直平面里 —— 硬压成 (x, z) 就等于把 y 丢掉，
+  *      往返校验会莫名其妙地"回到 0 但对不上"。
+  *
+  *   这一版必须带上底座角 θ：它不再只是"绕 z 转一下不影响 r/z"，
+  *   因为摆动平面是跟着 θ 一起转的，y 分量只有在 θ 确定后才定得下来。
   */
-void kin_scs_fk(const kin_scs_out_t *q, float *x_mm, float *z_mm);
+void kin_scs_fk(const kin_scs_out_t *q, float *x_mm, float *y_mm, float *z_mm);
 
 #ifdef __cplusplus
 }

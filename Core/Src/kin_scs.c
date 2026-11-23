@@ -116,13 +116,28 @@ uint8_t kin_scs_solve(const kin_scs_tgt_t *tgt, kin_scs_out_t *out)
   const float l1 = ARM_KIN_L1_MM;
   const float l2 = ARM_KIN_L2_MM;
 
-  float d;
-  float cb;
-  float cg;
-  float beta;
-  float gamma;
-  float phi1;
-  float bend;
+  /* 两个摆动平面的偏斜角。三角函数每次解算只算一遍（一次移动只调用一次），
+   * 所以不为了省这点时间去搞静态缓存。 */
+  const float s1 = sinf(ARM_KIN_J2_TILT_DEG * KIN_DEG2RAD);
+  const float c1 = cosf(ARM_KIN_J2_TILT_DEG * KIN_DEG2RAD);
+  const float s2 = sinf(ARM_KIN_J3_TILT_DEG * KIN_DEG2RAD);
+  const float c2 = cosf(ARM_KIN_J3_TILT_DEG * KIN_DEG2RAD);
+
+  float d;      /* 肩 → 目标的斜距 */
+  float r;      /* 目标的水平距离（绕肩轴量） */
+  float zt;     /* 目标的高度（以肩轴为零点，向上为正） */
+  float cb;     /* 余弦定理里的 cos(bend) */
+  float bend;   /* 几何弯曲量（度） */
+  float cc;     /* 末端横向偏出摆动平面多少 mm */
+  float lat;    /* cc + zt·s1，下面要用两次 */
+  float sn;     /* sin(θ − φ)，即底座要补转的那个角的正弦 */
+  float theta;  /* 修正后的底座角 */
+  float a;      /* 平面内：沿"前方"的分量 */
+  float bt;     /* 平面内：沿"平面自己的上"分量 */
+  float ap;     /* 平面内两连杆合成的"沿大臂"分量 */
+  float bp;     /* 平面内两连杆合成的"垂直大臂"分量 */
+  float psi;    /* 上面那个合矢量相对大臂的夹角 */
+  float phi1;   /* 大臂的几何仰角（度） */
 
   if ((tgt == 0) || (out == 0))
   {
@@ -148,7 +163,13 @@ uint8_t kin_scs_solve(const kin_scs_tgt_t *tgt, kin_scs_out_t *out)
 
   /* ---- ② 可达性：|L1 − L2| ≤ d ≤ L1 + L2 -------------------------------
    * 这是两连杆的硬边界。d 太远 = 伸直也够不着；d 太近 = 折到极限也靠不上。
-   * 注意这里**只**判几何可达，不管关节有没有超程 —— 那是调用方的事。 */
+   *
+   * ⚠️ 注意这里的 d 是**肩到目标的直线距离**，不是水平距离。
+   *    两个平面歪不歪**不影响**这条边界 —— 因为绕着连杆自身轴线转，
+   *    末端到肩的距离不变（后面③会再确认一次）。
+   *
+   * 所以平面偏斜只吃掉"方向"，不吃"距离"：斜距范围还是 62~148，
+   * 但理想仰角上限会从 90° 掉到 90° − TILT_J2。 */
   if (d < ((fabsf(l1 - l2)) - KIN_D_ESP))
   {
     return 0u;
@@ -165,101 +186,184 @@ uint8_t kin_scs_solve(const kin_scs_tgt_t *tgt, kin_scs_out_t *out)
     return 0u;
   }
 
-  /* ---- ③ 余弦定理 -------------------------------------------------------
-   *
-   *   三角形 O(肩) - E(肘) - P(末端)，三边 L1 / L2 / d：
-   *
-   *     β（肩处，OP 与大臂的夹角）  cos β = (L1² + d² − L2²) / (2·L1·d)
-   *     γ（肘处，两连杆的内夹角）    cos γ = (L1² + L2² − d²) / (2·L1·L2)
-   *
-   *   用 cos 而不是 sin 的好处：acos 能直接给出 [0, π] 的角，
-   *   不用判断象限，也就不会在 d 接近边界时因为 sin 变号出岔子。 */
-  cb = ((l1 * l1) + (d * d) - (l2 * l2)) / (2.0f * l1 * d);
-  cg = ((l1 * l1) + (l2 * l2) - (d * d)) / (2.0f * l1 * l2);
+  /* 球坐标 → 水平半径 + 高度。肩是原点，所以直接就是这两个分量。 */
+  r  = d * cosf(tgt->alpha_deg * KIN_DEG2RAD);
+  zt = d * sinf(tgt->alpha_deg * KIN_DEG2RAD);
 
-  beta  = acosf(clamp_unit(cb)) * KIN_RAD2DEG;
-  gamma = acosf(clamp_unit(cg)) * KIN_RAD2DEG;
+  /* ---- ③ 余弦定理直接给 bend -------------------------------------------
+   *
+   *   关键一步：**bend 是两根连杆之间的夹角**，跟两个摆动平面歪不歪、
+   *   歪多少**完全无关**。绕连杆自身轴线怎么扭都不改变两连杆的夹角。
+   *   所以平面偏斜一步都不用进这条公式：
+   *
+   *     d² = L1² + L2² + 2·L1·L2·cos(bend)
+   *     cos(bend) = (d² − L1² − L2²) / (2·L1·L2)
+   *
+   *   d = L1+L2（伸直）→ cos = 1 → bend = 0；
+   *   d = |L1−L2|（折死）→ cos = −1 → bend = 180°。定义域正好对上。
+   *
+   *   用 cos 不用 sin：acos 直接给 [0, π]，不用判象限，边界上也不会出岔子。 */
+  cb = ((d * d) - (l1 * l1) - (l2 * l2)) / (2.0f * l1 * l2);
+  bend = acosf(clamp_unit(cb)) * KIN_RAD2DEG;
 
-  /* ---- ④ 取 elbow-up 解 ------------------------------------------------
+  /* ---- ④ 平面偏斜修正：小臂的横向偏出 -----------------------------------
    *
-   *   大臂的**绝对仰角** φ1 = α + β  ← 加号就是"肘抬到 OP 线上方"
-   *   换成 elbow-down 只要把加号改减号，但那样大臂会压低、重力力臂变大，
-   *   而且和"解只有一个"的假设冲突，所以本模块不提供。
+   *   小臂的摆动平面相对大臂平面歪了 TILT_J3。这意味着弯肘的时候，
+   *   末端不是留在原平面里，而是**斜着出去**：
    *
-   *   肘的**弯曲量** bend = 180° − γ：两连杆共线时 γ = 180°、bend = 0。 */
-  phi1 = tgt->alpha_deg + beta;
-  bend = 180.0f - gamma;
+   *     c = −L2 · sin(TILT_J3) · sin(bend)
+   *
+   *   bend = 0（伸直）时 c = 0 —— 伸直的手臂没有"出平面"这回事；
+   *   bend = 90° 时偏出最多，等于 L2·sin(TILT_J3)。
+   *   按 105mm / 20° 算，最大偏出 36mm —— 这不是小数，必须算进来。
+   *
+   *   负号：以笛卡尔 x 向前、y 向左、z 向上，TILT_J3 > 0 时末端偏到 **−y** 侧
+   *   （俯视看是顺时针那侧）。实测反了就改 arm_cfg.h 里那个角的符号。 */
+  cc = -(l2 * s2 * sinf(bend * KIN_DEG2RAD));
 
-  /* ---- ⑤ 重力下垂补偿（11-23 实测：大臂低 10°、小臂多折 20°）-----------
+  /* ---- ⑤ 底座补转：把横向偏移"转"回去 ----------------------------------
    *
-   *   上面两步算出来的是**几何角** —— 手臂"应该"摆成什么样。
-   *   可真挂在那儿，重力会把大臂再压低 SAG_J2、把小臂再折进 SAG_J3，
-   *   所以命令角得先把这个量补回去（不是加在下垂那一侧，是反着提前补）：
+   *   手臂是歪的，末端天生偏在一边。想让它落到指定方位 φ 上，底座就不能
+   *   正好停在 φ，得偏一点。偏多少由几何直接解出来：
    *
-   *       命令 φ1   = 几何 φ1   + SAG_J2      ← 先抬高，掉下来才正好
-   *       命令 bend = 几何 bend − SAG_J3      ← 先放平，折进去才正好
+   *     目标点 P 在"θ 方位那个平面"的坐标系里 = (a, bt, c)
+   *     其中 c = cos(TILT_J2)·R·sin(θ−φ) − sin(TILT_J2)·Z
    *
-   *   ⚠️ J3 这条最容易搞反（"外歪"到底是往折的方向还是往开的方向）。
-   *      判据只有实测：命令 J3 折到某个角，看小臂实际停在哪边。
-   *      反了就改 arm_cfg.h 里 SAG_J3 的符号，**代码不用动**。
+   *   令它等于手臂能给出来的 c（④那条），解出
    *
-   *   补偿后 bend < 0 说明"这个姿态手臂本来就得伸直，再放平就是反向折了"，
-   *   机械上做不到 —— 夹到 0，让手臂保持伸直，那 20mm 的误差留在那儿。
-   *   ⚠️ 这是**几何意义上的**夹紧（bend 的定义域本来只有 [0,180]），
-   *      不是关节限位；关节超程仍然由调用方拒绝。 */
-  phi1 += ARM_KIN_J2_SAG_DEG;
-  bend -= ARM_KIN_J3_SAG_DEG;
+   *     sin(θ − φ) = ( c + Z·sin(TILT_J2) ) / ( R·cos(TILT_J2) )
+   *
+   *   右端超出 ±1 → 这个目标点根本不在这套几何能达到的曲面上，拒绝。
+   *   典型情况：目标贴着肩轴正上方（R≈0），而手臂因为 J2 歪了 10°，
+   *   最高只能指到 80°。 */
+  lat = cc + (zt * s1);
 
-  if (bend < 0.0f)
+  if (r < KIN_D_ESP)
   {
-    bend = 0.0f;
+    /* 目标正好在肩轴正上方/正下方：θ 无定义，只有偏斜恰好抵消时才有解 */
+    if ((lat > KIN_D_ESP) || (lat < -KIN_D_ESP))
+    {
+      return 0u;
+    }
+
+    theta = tgt->theta_deg;
+    a     = 0.0f;
+  }
+  else
+  {
+    sn = lat / (r * c1);
+
+    if ((sn > 1.0f) || (sn < -1.0f))
+    {
+      return 0u;
+    }
+
+    theta = tgt->theta_deg + (asinf(sn) * KIN_RAD2DEG);
+
+    /* a = R·cos(θ−φ)。用 sqrt 而不是再算一次 cos：|θ−φ| ≤ 90°，
+     * 所以 cos 一定是正的那个根。 */
+    a = r * sqrtf(1.0f - (sn * sn));
   }
 
-  /* ---- ⑥ 几何量 → 舵机命令角 -------------------------------------------
+  /* 平面内"上"方向的分量。cos(TILT_J2) 这一除是坐标变换带来的，
+   * 不是修正量 —— 偏斜角为 0 时它等于 1，退化成 bt = Z。 */
+  bt = (zt + (cc * s1)) / c1;
+
+  /* ---- ⑥ 平面内两连杆 → 大臂仰角 ---------------------------------------
+   *
+   *   现在 (a, bt) 已经是"落在这个摆动平面里"的坐标了，剩下的就是经典
+   *   平面两连杆。把两根连杆合成一个矢量：
+   *
+   *     A = L1 + L2·cos(bend)          ← 沿大臂方向的分量
+   *     B = L2·sin(bend)·cos(TILT_J3)  ← 垂直大臂的分量
+   *
+   *   B 里那个 cos(TILT_J3) 就是"小臂歪出去了一部分，剩下的才落在平面里"。
+   *
+   *     ψ  = atan2(B, A)
+   *     φ1 = atan2(bt, a) + ψ          ← 加号 = elbow-up，大臂抬到 OP 线上方
+   *
+   *   换成 elbow-down 只要把加号改成减号，但那样大臂会压低、重力力臂变大，
+   *   而且和"解只有一个"的假设冲突，所以本模块不提供。 */
+  ap  = l1 + (l2 * cosf(bend * KIN_DEG2RAD));
+  bp  = l2 * sinf(bend * KIN_DEG2RAD) * c2;
+  psi = atan2f(bp, ap) * KIN_RAD2DEG;
+
+  phi1 = (atan2f(bt, a) * KIN_RAD2DEG) + psi;
+
+  /* ---- ⑦ 几何量 → 舵机命令角 -------------------------------------------
    *
    *   两者之间只差一个"安装偏移 + 方向"：
    *
    *       命令角 = ARM_KIN_Jn_OFF_DEG + ARM_KIN_Jn_SIGN × 几何角
    *
    *   SIGN 只能是 +1 或 −1，对应舵机装反。跟 arm_cfg.c 里用
-   *   us_at_deg_min/max 对调来处理装反是一个套路：量出来填数，逻辑不动。 */
-  out->j1_deg = norm360(tgt->theta_deg);
+   *   us_at_deg_min/max 对调来处理装反是一个套路：量出来填数，逻辑不动。
+   *
+   *   注意 J1 输出的是**修正后**的 theta，不是上位机发进来的方位角 ——
+   *   差了那个 asin(·)。这是这套几何的必然结果，不是笔误。 */
+  out->j1_deg = norm360(theta);
   out->j2_deg = ARM_KIN_J2_OFF_DEG + (ARM_KIN_J2_SIGN * phi1);
   out->j3_deg = ARM_KIN_J3_OFF_DEG + (ARM_KIN_J3_SIGN * bend);
 
   return 1u;
 }
 
-void kin_scs_fk(const kin_scs_out_t *q, float *x_mm, float *z_mm)
+void kin_scs_fk(const kin_scs_out_t *q, float *x_mm, float *y_mm, float *z_mm)
 {
+  const float l1 = ARM_KIN_L1_MM;
+  const float l2 = ARM_KIN_L2_MM;
+
+  const float s1 = sinf(ARM_KIN_J2_TILT_DEG * KIN_DEG2RAD);
+  const float c1 = cosf(ARM_KIN_J2_TILT_DEG * KIN_DEG2RAD);
+  const float s2 = sinf(ARM_KIN_J3_TILT_DEG * KIN_DEG2RAD);
+  const float c2 = cosf(ARM_KIN_J3_TILT_DEG * KIN_DEG2RAD);
+
   float phi1;
   float bend;
-  float a1;
-  float a2;
-  float x;
-  float z;
+  float theta;
+  float ap;
+  float bp;
+  float cp;
+  float a;
+  float bt;
+  float c;
+  float u;
+  float p1;
+  float p2;
+  float p3;
 
-  if ((q == 0) || (x_mm == 0) || (z_mm == 0))
+  if ((q == 0) || (x_mm == 0) || (y_mm == 0) || (z_mm == 0))
   {
     return;
   }
 
   /* 命令角 → 几何角。SIGN 是 ±1，所以 1/SIGN == SIGN。 */
-  phi1 = (q->j2_deg - ARM_KIN_J2_OFF_DEG) * ARM_KIN_J2_SIGN;
-  bend = (q->j3_deg - ARM_KIN_J3_OFF_DEG) * ARM_KIN_J3_SIGN;
+  phi1  = (q->j2_deg - ARM_KIN_J2_OFF_DEG) * ARM_KIN_J2_SIGN;
+  bend  = (q->j3_deg - ARM_KIN_J3_OFF_DEG) * ARM_KIN_J3_SIGN;
+  theta = q->j1_deg * KIN_DEG2RAD;
 
-  /* 再把⑤里补的下垂量扣回去，还原成**真实的几何姿态**。
-   * ⚠️ 正解描述的是"舵机停在命令角时手臂**实际**在哪"，所以扣回去是对的
-   *    —— 这样 solve → fk 才有意义（描述同一个物理姿态）。 */
-  phi1 -= ARM_KIN_J2_SAG_DEG;
-  bend += ARM_KIN_J3_SAG_DEG;
+  /* 平面内两连杆合成一个矢量，再拆成 (沿大臂, 垂直大臂) */
+  ap  = l1 + (l2 * cosf(bend * KIN_DEG2RAD));
+  bp  = l2 * sinf(bend * KIN_DEG2RAD) * c2;
+  cp  = l2 * sinf(bend * KIN_DEG2RAD) * s2;
 
-  a1 = phi1 * KIN_DEG2RAD;
-  a2 = (phi1 - bend) * KIN_DEG2RAD;
+  /* 转到"这个摆动平面"的坐标里：(a 前, bt 上, c 法向) */
+  p1 = phi1 * KIN_DEG2RAD;
+  a  = (ap * cosf(p1)) + (bp * sinf(p1));
+  bt = (ap * sinf(p1)) - (bp * cosf(p1));
+  c  = -cp;
 
-  x = (ARM_KIN_L1_MM * cosf(a1)) + (ARM_KIN_L2_MM * cosf(a2));
-  z = (ARM_KIN_L1_MM * sinf(a1)) + (ARM_KIN_L2_MM * sinf(a2));
+  /* 再转回世界坐标：θ 绕竖轴，TILT_J2 是平面自身的倾斜。
+   * 三个基向量是
+   *     前  = (cosθ,             sinθ,             0   )
+   *     上  = ( s1·sinθ,        −s1·cosθ,         c1  )
+   *     法向 = ( c1·sinθ,        −c1·cosθ,        −s1  )
+   * 所以直接按分量展开，不需要构造矩阵。 */
+  u  = (bt * s1) + (c * c1);
+  p2 = theta;
+  p3 = (bt * c1) - (c * s1);
 
-  *x_mm = x;
-  *z_mm = z;
+  *x_mm = (a * cosf(p2)) + (u * sinf(p2));
+  *y_mm = (a * sinf(p2)) - (u * cosf(p2));
+  *z_mm = p3;
 }
