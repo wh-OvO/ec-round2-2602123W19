@@ -130,12 +130,16 @@ static uint8_t base_read_deg(float *deg)
    *   → u 顶到 300µs → 底座全速转 90° 才停 → 撞限位。
    *   改 CENTER 就要同时改 deg_home，否则上电第一拍就是满误差。
    *
-   * ★ 2026-11-20：J1 改成 2~312 之后 CENTER = 157，读数变成 (−23, 337]。
-   *   接缝（wrap180 折返处）落在 CENTER ± 180 = **−23 / 337**，也就是
-   *   "旧 home 两侧各 180°"那两个机械柱子。软限位 [2, 312] 离接缝各剩 25°。
-   *   ⚠️ CENTER 必须和 deg_home 一起改。2026-11-12 就是只改了 CENTER 没改
-   *      deg_home，上电第一拍误差 90° → u 顶到 300µs → 全速撞限位。
-   *      现在 u_max 限到 50µs 不会飞车，但方向仍然是错的。 */
+   * ★ 2026-11-23 20:40：**加 ARM_BASE_DEG_SCALE**。
+   *   用户实测「上位机目标/实际都是 90，但手臂现实里转了 120」——
+   *   编码器**少读**了：1° 读数对应 1.3333° 真实转角。
+   *   所以 wrap180 之后再乘 SCALE 换成真实角，最后加 CENTER。
+   *
+   *   ⚠️ SCALE 必须乘在 wrap180 **之后**：折返要在"原始磁角度"空间里做，
+   *      先缩放再折返的话接缝会跑到 ±180/SCALE 上去，整个标定都错位。
+   *   接了 SCALE 之后接缝落在 CENTER ± 180×SCALE：
+   *      −22.5 ∓ 240 = **−262.5 / +217.5**，离行程 [−180, +135] 两头各剩 82°。
+   */
 #if ARM_BASE_DIAG_RAW
   /* ===== 临时诊断（2026-11-17 夜，会话 F）=====
    * 直通输出 AS5600 的**原始磁角度**，上位机「实际」直接显示 0~360°。
@@ -145,7 +149,8 @@ static uint8_t base_read_deg(float *deg)
   (void)center;
   *deg = raw;
 #else
-  *deg = wrap180(ARM_BASE_ENC_SIGN * (raw - ARM_BASE_ENC_ZERO_DEG)) + center;
+  *deg = wrap180(ARM_BASE_ENC_SIGN * (raw - ARM_BASE_ENC_ZERO_DEG))
+         * ARM_BASE_DEG_SCALE + center;
 #endif
 
   return 1u;
