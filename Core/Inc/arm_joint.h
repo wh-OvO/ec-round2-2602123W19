@@ -80,9 +80,17 @@ void arm_joint_set_traj(uint8_t joint, float deg, float v_dps);
   * @param  joint 关节编号 0~3
   * @retval 角度（度）
   * @note   位置型：由 CCR 反算（没有编码器，这是能做到的最好的）
-  *         速度型：读 AS5600 真实角度；读失败时退回目标值，保证不返回垃圾
+  *         速度型：读 AS5600 真实角度；读失败时退回**上一次成功值**并置
+  *         base_fault（不返回目标值，也不返回 −100/−200 哨兵）
   */
 float arm_joint_get_deg(uint8_t joint);
+
+/**
+  * @brief  取底座最近一次**成功**读到的角度（不发起 I²C）
+  * @note   专给 50Hz 状态帧用。arm_joint_get_deg(0) 会真读一次 AS5600，
+  *         放在上报路径里会挤占 5ms 插补预算。位置型关节不需要这个。
+  */
+float arm_joint_get_deg_cached(void);
 
 /**
   * @brief  读某一路当前脉宽（µs），供 0x32 回帧用

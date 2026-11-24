@@ -94,14 +94,16 @@ extern "C" {
  *   对**奇异位形与越限**有处理」—— 三件事都得有各自的话说，
  *   只回一个笼统的"失败"，评审一问就答不上来。
  *
- * 约定：0x00 / 0x03 / 0x05 = **已经动了**（后两个带警告）；
- *       其余 = **没动**，手臂保持原位。上位机据此决定要不要重发。 */
+ * 约定：0x00 / 0x03 = **已经动了**（0x03 带警告）；
+ *       其余（含 0x05）= **没动**，手臂保持原位。上位机据此决定要不要重发。
+ *       ★ 2026-11-24 起 0x05 从“已执行·钳位”改成“拒绝·没动”：逆解结果越限
+ *       说明末端目标本身在关节空间外，静默钳位会让末端偏出几十度还报成功。 */
 #define PROTO_CART_OK            0x00u  /* 执行成功 */
 #define PROTO_CART_NOT_READY     0x01u  /* 拒绝：几何参数未标定（kin_scs_ready()==0） */
 #define PROTO_CART_UNREACHABLE   0x02u  /* 拒绝：目标超出可达斜距范围 */
 #define PROTO_CART_SING_BASE     0x03u  /* 已执行 · 底座奇异（目标在底座轴上，θ 沿用当前角） */
 #define PROTO_CART_SING_AXIS     0x04u  /* 拒绝：目标落在肩轴心上（d≈0，仰角 α 无定义） */
-#define PROTO_CART_LIMITED       0x05u  /* 已执行 · 解出的关节角被软限位钳位 */
+#define PROTO_CART_LIMITED       0x05u  /* 拒绝 · 解出的关节角超出软限位（未执行） */
 #define PROTO_CART_FAULT         0x06u  /* 拒绝：故障态 */
 #define PROTO_CART_BADLEN        0x07u  /* 拒绝：载荷长度不对 */
 

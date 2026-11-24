@@ -78,6 +78,11 @@ static void MX_USART1_UART_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+/* I²C1 目标速率。T4 的判据写的是 400kHz；本工程因杜邦线长/上拉弱
+ * 实测 400kHz 偶发 NACK，定为 100kHz（plan.md §8 2026-11-15 19:45）。
+ * 改回 400kHz 只动这一个宏 —— 生成区保持 CubeMX 原样，见 MX_I2C1_Init 的 USER CODE 2。 */
+#define ARM_I2C1_CLOCK_HZ   100000u
+
 /* ---------------- 日志输出：**只走 USART1** ----------------
  * ⚠️ 绝对不要把日志写进 USB CDC。
  *
@@ -204,7 +209,10 @@ static void print_banner(void)
   /* T4：上电探测结果。没装也不影响舵机 —— 见 mpu6050.h 里 MPU6050_REQUIRED */
   if (mpu6050_present() != 0u)
   {
-    printf("[T4] MPU6050 在线 (WHO_AM_I=0x68, ±2g/±500dps, I2C1 400kHz)\r\n");
+    /* 不写死 WHO_AM_I=0x68：probe 接受 0x68/0x70/0x71 三种克隆片。
+     * 速率也按宏打印 —— 原来写“400kHz”而实际跑 100kHz，是自相矛盾的证据。 */
+    printf("[T4] MPU6050 在线 (±2g/±500dps, 50Hz, I2C1 %ukHz)\r\n",
+           (unsigned)(ARM_I2C1_CLOCK_HZ / 1000u));
   }
   else
   {
@@ -227,8 +235,8 @@ static void t0_setup(void)
    * 必须在 arm_init() 之后 —— 它内部要往 CCR 写零位脉宽。 */
   arm_joint_init();
 
-  /* T4 姿态传感器：探测 MPU6050（WHO_AM_I=0x68）+ 配量程/滤波/采样率。
-   * 此时 MX_I2C1_Init() 已经跑过，I2C1 是 400kHz。
+  /* T4 姿态传感器：探测 MPU6050（WHO_AM_I 接受 0x68/0x70/0x71）+ 配量程/滤波/采样率。
+   * 此时 MX_I2C1_Init() 已经跑过，I2C1 是 ARM_I2C1_CLOCK_HZ（当前 100kHz）。
    * 内部有约 110ms 的软复位等待，只在启动时做一次。 */
   (void)mpu6050_init();
 
@@ -250,11 +258,10 @@ static uint8_t key_scan(void)
   static uint8_t  raw_prev = 0;
   static uint32_t t_edge   = 0;
 
-  /* ★ 野火板 KEY1 = PA0，**按下去接的是 3V3**（板上外部下拉，官方 HAL 例程
-   *   也是按 `ReadPin() == 1` 判断按下），所以"按下"读到的是 GPIO_PIN_SET。
-   *   上一版 Blue Pill 用的是接地微动开关 + 内部上拉，判断条件正好相反
-   *   （GPIO_PIN_RESET），迁移时这一行必须跟着翻过来，否则按键逻辑整个反掉。
-   *   兜底：KEY 在 CubeMX 里配成 GPIO_PULLDOWN，线没插好时稳定读"松开"。 */
+  /* ★ PA0 外接按键：**按下接 3V3**，10k 下拉（CubeMX 里 KEY 也配成
+   *   GPIO_PULLDOWN 兜底），所以"按下"读到的是 GPIO_PIN_SET。
+   *   如果换成接地按键 + 内部上拉，这一行必须翻成 GPIO_PIN_RESET，
+   *   否则按键逻辑整个反掉。线没插好时引脚被下拉，稳定读"松开"。 */
   uint8_t  raw = (HAL_GPIO_ReadPin(KEY_GPIO_Port, KEY_Pin) == GPIO_PIN_SET) ? 1u : 0u;
   uint32_t now = HAL_GetTick();
 
@@ -279,11 +286,25 @@ static uint8_t key_scan(void)
 /* ---------------- T0 主循环体 ---------------- */
 static void t0_loop(void)
 {
-  static uint8_t led_on = 0;    /* 逻辑亮灭；野火板 PA1=LED_R 低电平点亮 */
+  static uint8_t  led_on  = 0;   /* 逻辑亮灭；PA1=LED，低电平点亮 */
+  static uint32_t t_blink = 0;
+
+  /* T0 原文：「LED 以 1Hz 闪烁，按键能翻转 LED 状态」。
+   * 1Hz = 每 500ms 翻转一次；按键翻转叠加在闪烁之上并重置计时，
+   * 按下的瞬间一定看得到变化，不会被下一拍闪回去。
+   * ★ 2026-11-24 补：此前这里只有按键翻转、没有周期翻转，
+   *   而 README / AI.MD 都写着“LED 1Hz 闪烁”—— 属于记录不实，一并纠正。 */
+  if ((HAL_GetTick() - t_blink) >= 500u)
+  {
+    t_blink = HAL_GetTick();
+    led_on  = (uint8_t)!led_on;
+    HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, led_on ? GPIO_PIN_RESET : GPIO_PIN_SET);
+  }
 
   if (key_scan())
   {
-    led_on = (uint8_t)!led_on;
+    led_on  = (uint8_t)!led_on;
+    t_blink = HAL_GetTick();      /* 重置闪烁相位，按下后至少亮/灭满 500ms */
     HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, led_on ? GPIO_PIN_RESET : GPIO_PIN_SET);
     /* 脚名跟 main.h 的 KEY_GPIO_Port / KEY_Pin 走。
      * 换板改引脚时，这行字符串里的 "PA0" 也要跟着改，不然日志会骗人。 */
@@ -407,14 +428,7 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  /* ★ 手写补丁（2026-11-15）：400000 → 100000。
-   *   400kHz(Fast) 对杜邦线太苛刻：线长一过 15~20cm，上升沿就靠 4.7k 上拉
-   *   慢慢爬，边沿不够陡 → 偶发 NACK/总线卡死 → mpu6050 判丢线 → 整臂被锁。
-   *   100kHz(Standard) 是 I²C 的保守档，对线长和上拉宽容得多，采样率 50Hz
-   *   根本用不上 400kHz 的带宽。
-   *   ⚠️ 这一行在 CubeMX 的**生成区**里，重新 GENERATE CODE 会被改回 400000，
-   *      和 STM32F103C8Tx_FLASH.ld 一样属于"每次生成后要手工补"的清单。 */
-  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.ClockSpeed = 400000;
   hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
   hi2c1.Init.OwnAddress1 = 0;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
@@ -427,6 +441,16 @@ static void MX_I2C1_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* ★ 2026-11-24：降速覆盖从**生成区**挪到这里（原来直接改上面那行 400000→100000）。
+   * 两个原因：① 任务书 2.4.5 禁止改 CubeMX 生成区；② .ioc 仍是 Fast/400kHz，
+   * 重新 GENERATE 会把生成区改回 400000，代码与工程文件长期互相矛盾。
+   * 现在生成区保持原样，这里按 ARM_I2C1_CLOCK_HZ 重配一次。 */
+  hi2c1.Init.ClockSpeed = ARM_I2C1_CLOCK_HZ;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
   /* USER CODE END I2C1_Init 2 */
 

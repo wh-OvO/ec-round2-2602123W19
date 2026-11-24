@@ -32,7 +32,7 @@
 
 | # | 日期 | 涉及文件 / 模块 | 用途 | 采用 | 验证方式 | commit |
 |---|---|---|---|---|---|---|
-| 1 | 2026-11-06 | `Core/Src/main.c`、`CMakeLists.txt`、`cmake/` | T0 工程骨架：CubeMX 生成后，编写开机自检日志、LED 1Hz 闪烁、按键翻转、复位原因打印 | 是 | 编译通过；串口实测打印正确 | `f420298` |
+| 1 | 2026-11-06 | `Core/Src/main.c`、`CMakeLists.txt`、`cmake/` | T0 工程骨架：CubeMX 生成后，编写开机自检日志、按键翻转 LED、复位原因打印 | 是 | 编译通过；串口实测打印正确。**1 Hz 周期闪烁是 2026-11-24 才补的**（第 53 条），此前只有按键翻转 | `f420298` |
 | 2 | 2026-11-06 | `Core/Src/arm_pwm.c`、`arm_cfg.c/h`、`main.c` | T1 角度→脉宽线性映射、四路 PWM 初始化、参数集中到 `arm_cfg.h` | 是 | 四路 PWM 电压实测（死区/满量程），见 `plan.md` §6.1 | `7bf424b` |
 | 3 | 2026-11-07 | `CMakeLists.txt`、`cmake/gcc-arm-none-eabi.cmake` | 对齐任务书 2.2：工具链文件与 Release 预设 | 是 | 编译通过（Debug/Release 双预设） | `45506c9` |
 | 4 | 2026-11-07 | `Core/Src/proto_frame.c`、`Core/Inc/proto.h`、`tests/proto_selftest.c` | T5a-1 协议地基：CRC8(0x07)、组帧、流式解帧；PC 端单元测试 | 是 | PC 单测 **25/25 通过** | `a77846b` |
@@ -61,7 +61,7 @@
 | 27 | 2026-11-13 | `docs/T1_角度脉宽映射_说明.md`、`docs/接线与实物数据流.md` | 引脚表换野火脚位、修 T1 映射示例、标注旧接线方案作废 | 是 | 本人校对 | `cec72fe` |
 | 28 | 2026-11-13 | `docs/T2_插补增量数值验证.md`、`docs/img/` | 从 `proto_app.c` 逐行复算三档增量，出对照图作为 T2 定量证据 | 是 | 复算脚本 + 与上机曲线形状对照 | `cd2c80e` |
 | 29 | 2026-11-13 | `Core/Src/arm_cfg.c` | J4 夹爪按实物标定改为 0~120° / 1430~1530 µs | 是 | 本人三点实测（0/60/120° → 1430/1480/1530 µs） | `f0d1df8` |
-| 30 | 2026-11-13 | `Core/Src/arm_pid.c`、`Core/Inc/arm_pid.h`、`tests/pid_selftest.c`、`arm_joint.c`、`arm_cfg.h`、`CMakeLists.txt` | **PID 模块**：位置式 PID（P/I/D + 前馈 + 死区 + 抗饱和 + D 低通），接入底座闭环；PC 单元测试 32 条 | 是 | PC 单测 **32/32**；其中 `Ki=Kd=0` 时与旧纯 P 代码**逐位相同**（52806 组）；固件编译 `exit=0` | **未提交**（工作区） |
+| 30 | 2026-11-13 | `Core/Src/arm_pid.c`、`Core/Inc/arm_pid.h`、`tests/pid_selftest.c`、`arm_joint.c`、`arm_cfg.h`、`CMakeLists.txt` | **PID 模块**：位置式 PID（P/I/D + 前馈 + 死区 + 抗饱和 + D 低通），接入底座闭环；PC 单元测试 32 条 | **否**（当天未提交；同一份改动 11-20 由第 34 条重新落地并扩到 40 条） | 同第 34 条 | —（见第 34 条 `c5773d4`） |
 | 31 | 2026-11-13 | `Drivers/CMSIS/Lib/`（删除）、`.gitignore`、`README.md`、`AI.MD` | 按任务书 2.4.2 删除 5 个无源码预编译库（34.1 MB）；补本文件与 README | 是 | 从零全量构建 `exit=0`，FLASH 41096 B / 62.71% 与删除前一致 | `8699455` |
 | 32 | 2026-11-13~14 | `Core/Src/arm_cfg.c`、`Core/Inc/arm_cfg.h`、`docs/AS5600_零点标定_实操.md` | AS5600 零点标定起步：J1 `.kind` 切 `ARM_JOINT_VEL`、`.us_stop` 填 1500、`ARM_BASE_U_MAX_US` 300→50（SIGN 填反时只慢爬不飞车）；新增 5 步标定手册 + 4 类故障表 | 是 | 编译 `exit=0`；**标定本身未上板**，手册待本人照着做 | `45cac9e` |
 | 33 | 2026-11-14 | `AI.MD` | 回填第 31 / 32 条的提交哈希，并核对 `git log --grep="^AI:"` 与本文表格一一对应 | 是 | 本机核对：两条提交均能被 `git log --grep="^AI:"` 检索到 | **本条** |
@@ -82,6 +82,10 @@
 | 48 | 2026-11-24 | `proto_app.c/h`、`proto.h`、`kin_c2s.c/h`、`kin_scs.c/h`、`tests/cart_chain_selftest.c`、`tests/c2s_selftest.c`、`CMakeLists.txt` | 接入 0x34 笛卡尔逆解三段链路，不可达/底座奇异/肩轴奇异/越限四类独立应答 | 是 | 编译 exit=0；`cart_chain_selftest` 1622/1622（<0.05 mm）、`c2s_selftest` 53、`scs_selftest` 33；**未上板** | `cdc05d6` |
 | 49 | 2026-11-24 | `proto_app.c`、`docs/plan.md` | 回填 0x34 两笔提交号与烧录结果，重写时间参数块注释 | 是 | 烧录 `Download verified successfully`（43.67 KB）；注释改动逐条数过 6 个常量、值未变 | `455c5ca` |
 | 50 | 2026-11-24 | `docs/plan.md` | 定位「全都不会动」为上位机把整帧当载荷重套一层（BADLEN） | 是 | 界面 CRC8=0x71 与按 `A5 34 0D` + 13 字节重算一致；固件无需改动 | `fb75180` |
+| 51 | 2026-11-24 | 仅 git 历史（无文件改动） | 给 11-20 后 17 条提交补 `AI:` / `Verified:` 尾行（`commit-tree` 重建 message，tree 不变） | 是 | `git diff pre-trailer-backup fb75180` 为空；旧 HEAD 留 tag | `349a7f9` |
+| 52 | 2026-11-24 | `docs/plan.md` | 0x34 上板实测通过（00/00/00/02/04 全对），记下臂长模型不一致 | 是 | 本人上板逐帧核对应答码 | `98037d1` |
+| 53 | 2026-11-24 | `Core/Inc/arm_cfg.h`、`Core/Src/arm_cfg.c`、`Core/Src/main.c`、`Core/Src/proto_app.c` | J1 上限 135→145，CENTER −22.5→−17.5，ZERO 182.0→178.25；**补上 T0 的 1 Hz 周期闪烁**；0x10 底座改读缓存值 | 是 | 编译 exit=0；HEX 相差 444 B；**未上板复验**（改的是运动参数） | `11b2b08` |
+| 54 | 2026-11-24 | `arm_cfg.h/c`、`arm_joint.c/h`、`proto_app.c`、`proto.h`、`kin_c2s.c`、`main.c`、`README.md`、`AI.MD` | 总排查修补：删 −100/−200 哨兵、限位外可回拉、到位阈值 2.0°、0x34 越限改拒绝且不脏目标、故障态只认 0x21=3、传感器丢线必停、插补拍 `+=` 补拍、I²C 降速挪出生成区、ERROR/状态位/坐标系注释纠错 | 是 | Debug/Release `exit=0`；7 套 PC 单测全过（28/40/33/16/53/1622/8）；**未上板** | **本条** |
 
 ---
 
@@ -130,7 +134,8 @@
 
 - **做法**：`git commit-tree` 逐条重建 message，再用 `git update-ref`（带旧值做 CAS）一次性切换分支。
   **只加尾行**，不改任何文件内容 —— 每个提交的 tree 与改写前**逐字节相同**
-  （`git diff pre-trailer-backup HEAD` 为空），作者、提交者与两个时间戳全部保留。
+  （`git diff pre-trailer-backup fb75180` 为空；不要用 `HEAD`，那之后又有了 3 笔提交），
+  作者、提交者与两个时间戳全部保留。
 - **旧历史**：改写前的 HEAD `0bf5680` 保留在 tag `pre-trailer-backup`，可随时 `git show` 回溯。
 - **哈希变了**：17 个短哈希全部不同。下表是改写前后的对照，
   `plan.md` 与之配套的 `docs/plan.md`、`docs/接线与实物数据流.md` 里引用旧哈希的地方已同步替换。
@@ -147,5 +152,7 @@
 | `5b230bb` | `7c30de6` | `0bf5680` | `fb75180` |
 | `f228d91` | `b7b6f6f` | — | — |
 
-- **补记之后**：`git log --grep="^AI:"` 命中 **20** 条（3 条 11-14 原有 + 17 条本次补记），
-  总提交数仍是 49 条。此后每一笔提交都必须在 message 末尾带 `AI:` / `Verified:` 两行。
+- **补记之后**：`git log --grep="^AI:"` 命中 **23** 条，总提交数 **53** 条。
+  （基线：补记当时是 22 / 52；第 54 条又补 1 条。11-24 的 `98037d1`、`11b2b08` 两笔
+  当时未带尾行，**未改写历史**，留作已知瑕疵。）
+  此后每一笔提交都必须在 message 末尾带 `AI:` / `Verified:` 两行。

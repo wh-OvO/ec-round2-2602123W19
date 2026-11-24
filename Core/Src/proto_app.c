@@ -207,14 +207,16 @@ static int16_t to_x10(float deg)
 /* J1 坐标换算：**没有了** —— 上位机和固件现在是同一个坐标系                  */
 /* ------------------------------------------------------------------------- */
 
-/* 2026-11-23 20:10：J1 的限位改成 **home = 0、−180 ~ +135**（见 arm_cfg.c），
+/* 2026-11-24：J1 的限位是 **home = 0、−180 ~ +145**（11-23 定的 +135 已改，
+ * 见 arm_cfg.c；接缝随之从 −202.5/+157.5 移到 −257.5/+222.5），
  * 这一改直接把换算层消掉了：
  *
  *     上位机 −180  ←→  固件 −180  ←→  一端的机械柱
  *     上位机    0  ←→  固件    0  ←→  home
- *     上位机 +135  ←→  固件 +135  ←→  另一端的机械柱（离整圈还差 45°）
+ *     上位机 +145  ←→  固件 +145  ←→  另一端的机械柱（离整圈还差 35°）
  *
- * 两边字节语义完全一致，所以 send_status() 直接把 arm_joint_get_deg(0) 和
+ * 两边字节语义完全一致，所以 send_status() 直接把底座缓存值
+ * （arm_joint_get_deg_cached()，5ms 刷新一次，不再现读 I²C）和
  * s_tgt_x10[0] 原样填进 0x10 帧，on_target() 也原样收，不做任何加减。
  * 线协议一个字节都没动，ArmHost 那边不用改。
  *
@@ -224,7 +226,7 @@ static int16_t to_x10(float deg)
  *   · 11-21 22:55：试过"按比例铺满 ±180"，显示角比真实角小 13.9%，被否掉
  *     （用户：「按比例映射，不如不映射」）。
  *   · 11-21 23:10：试过"上位机 + 180 = 固件"，home 落在 −180。能用，但别扭。
- *   · 11-23 20:10：**把 home 放回 0**，限位 −180/+135，行程 315° 正好塞进
+ *   · 11-23 20:10：**把 home 放回 0**，限位 −180/+135（11-24 改 +145），行程 325° 正好塞进
  *     上位机的 ±180 —— 换算层彻底不需要了。
  *
  * ⚠️ 只剩 ARM_BASE_ENC_ZERO_DEG（arm_cfg.h）还带坐标系语义：
@@ -244,7 +246,12 @@ uint8_t proto_app_status(void)
   {
     st |= PROTO_ST_AUTO;                       /* bit0 自动 */
   }
-  if ((s_mode == PROTO_MODE_HOMING) && ((now - s_ms_homing) < APP_HOMING_SHOW_MS))
+  /* bit1 = 回零**进行中**。APP_HOMING_SHOW_MS 只是最短展示时间，不能当回零时长：
+   * ARM_HOMING_MS 是 800ms，只按 500ms 判会在最后 300ms 提前灭灯，上位机若按
+   * bit1 下降沿判“回零完成”，就会取到中间位。 */
+  if ((s_mode == PROTO_MODE_HOMING) &&
+      (((now - s_ms_homing) < APP_HOMING_SHOW_MS) ||
+       (s_moving != 0u) || (arm_joint_moving() != 0u)))
   {
     st |= PROTO_ST_HOMING;                     /* bit1 正在回零 */
   }
@@ -286,11 +293,14 @@ static void send_status(uint32_t now)
   uint8_t pl[PROTO_LEN_STATUS];
   uint8_t j;
 
-  for (j = 0u; j < ARM_JOINT_NUM; j++)
+  /* ★ 2026-11-24：底座取**缓存值**，不在 50Hz 上报里现读 I²C。
+   * 原来每条 0x10 都调 arm_joint_get_deg(0) → 一次阻塞 I²C（超时 2ms），
+   * 正好卡在 5ms 插补节拍里，是 T2「200Hz 没余量」的一半来源。
+   * 缓存由 5ms 的 vel_tick() 每次读成功后刷新，最多旧一个插补拍。
+   * J1 与上位机同坐标系（home = 0、−180~+145），原样上报。 */
+  put_i16(&pl[0], to_x10(arm_joint_get_deg_cached()));
+  for (j = 1u; j < ARM_JOINT_NUM; j++)
   {
-    /* 走关节层而不是 arm_pwm：
-     * 底座会读 AS5600 报真实角度，其余三路仍是 CCR 反算。
-     * J1 和上位机同坐标系（home = 0、−180~+135），原样上报。 */
     put_i16(&pl[(uint16_t)j * 2u], to_x10(arm_joint_get_deg(j)));
   }
   for (j = 0u; j < ARM_JOINT_NUM; j++)
@@ -617,6 +627,27 @@ static void interp_tick(uint32_t now)
  * 就成了绕过限位的后门，而且是"看着能跑"的那种后门。
  *
  * 返回值 = 1 表示至少有一个轴被钳位（调用方要用它回 0x05）。 */
+/* 只判不改的限位检查：给 0x34 用。
+ * 为什么不用 store_q_x10 的返回值：那个函数是“边判边写”，等它返回 1 时
+ * s_tgt_x10 / s_limit_hit 已经被改脏了，再想“拒绝执行”就得回滚。 */
+static uint8_t q_any_out_of_limit(const int32_t q_in[ARM_JOINT_NUM])
+{
+  uint8_t j;
+
+  for (j = 0u; j < ARM_JOINT_NUM; j++)
+  {
+    int32_t lo = (int32_t)g_arm_joint[j].deg_min * 10;
+    int32_t hi = (int32_t)g_arm_joint[j].deg_max * 10;
+
+    if ((q_in[j] < lo) || (q_in[j] > hi))
+    {
+      return 1u;
+    }
+  }
+
+  return 0u;
+}
+
 static uint8_t store_q_x10(const int32_t q_in[ARM_JOINT_NUM])
 {
   uint8_t j;
@@ -638,7 +669,7 @@ static uint8_t store_q_x10(const int32_t q_in[ARM_JOINT_NUM])
    * 但以后要是有人把 deg_max 改成 4000（0.1° 单位），int16_t 就会悄悄溢出。 */
   for (j = 0u; j < ARM_JOINT_NUM; j++)
   {
-    /* J1 和上位机同坐标系（home = 0、−180~+135），原样收，只做钳位。
+    /* J1 和上位机同坐标系（home = 0、−180~+145），原样收，只做钳位。
      * J2/J3/J4 本来就是 0~180，也一样。 */
     q  = q_in[j];
     lo = (int32_t)g_arm_joint[j].deg_min * 10;
@@ -701,6 +732,13 @@ static void on_target(const proto_frame_t *fr)
   {
     return;                          /* 长度不对直接忽略，不当成致命错误 */
   }
+  /* 故障态一律不改目标。0x20 没有应答，如果这里还写 s_tgt_x10、刷超时、
+   * 清 s_dbg，0x10 会报出一个从未执行的 q_tgt，还会把 bit5 掩盖掉；
+   * 退出故障的唯一入口是 0x21=3（附件一 §4.4）。 */
+  if ((s_fault != 0u) || (s_sensor_fault != 0u))
+  {
+    return;
+  }
 
   for (j = 0u; j < ARM_JOINT_NUM; j++)
   {
@@ -755,7 +793,10 @@ static uint8_t solve_cart(const proto_frame_t *fr, int32_t q_out[ARM_JOINT_NUM])
   {
     return PROTO_CART_BADLEN;
   }
-  if (s_fault != 0u)
+  /* 与 move_start() 取同一判据：只有 s_fault 不够 —— 传感器故障时
+   * move_start() 会直接 return，但这里若放行就会先 store + commit 再回 0x00
+   * “已执行”，而手臂一下都没动（proto.h 约定 0x00 = 已经动了）。 */
+  if ((s_fault != 0u) || (s_sensor_fault != 0u))
   {
     return PROTO_CART_FAULT;
   }
@@ -766,9 +807,9 @@ static uint8_t solve_cart(const proto_frame_t *fr, int32_t q_out[ARM_JOINT_NUM])
   }
 
   /* ---- ② 取当前底座角：只用于"目标落在底座转轴上"那个奇点 ---- */
-  /* AS5600 读不到时 arm_joint_get_deg() 返回 −100 / −200 哨兵，而
-   * **−100 本身是一个合法角度**，没法靠范围识别 —— 所以直接问故障位，
-   * 坏掉就用上一次的目标角兜底（那是协议层自己的值，永远可信）。 */
+  /* 底座读失败时 arm_joint_get_deg() 现在返回**上一次成功值**（不再有
+   * −100/−200 哨兵），但它最多只旧 5ms；故障期间仍用协议层自己的目标角兜底，
+   * 避免拿一个“可能已经过期”的实测值去算奇点分支。 */
   cur_theta = arm_joint_get_deg(0u);
   if (arm_joint_base_fault() != 0u)
   {
@@ -808,8 +849,8 @@ static uint8_t solve_cart(const proto_frame_t *fr, int32_t q_out[ARM_JOINT_NUM])
 
   /* ---- ⑥ ⚠️ 坐标系对齐：这一步漏了会算错，而且不报任何错 ---- */
   /* kin_scs_solve() 的 out->j1_deg 是 norm360(...)，范围 **0 ~ 360**；
-   * 而 arm_cfg.c 里 J1 是 **−180 ~ +135**。不绕的后果：
-   *     θ = 330°（其实就是 −30°）→ j1 = 330 → 被钳到 135° → 关节反着跑一大截。
+   * 而 arm_cfg.c 里 J1 是 **−180 ~ +145**。不绕的后果：
+   *     θ = 330°（其实就是 −30°）→ j1 = 330 → 被钳到 145° → 关节反着跑一大截。
    * 绕回的逻辑放在 kin_scs_wrap180()（左闭右开 [−180, 180)），那里能被单测钉死，
    * 这里不要就地再写一遍 while，两份一不一致就又是个"看着能跑"的 bug。 */
   j1 = kin_scs_wrap180(sol.j1_deg);
@@ -845,14 +886,20 @@ static void on_cart(const proto_frame_t *fr)
 
   if ((code == PROTO_CART_OK) || (code == PROTO_CART_SING_BASE))
   {
-    limited = store_q_x10(q_in);     /* 和 0x20 走同一道限位闸 */
-    commit_target(get_u16(&fr->payload[6]), fr->payload[8]);
-
-    /* 钳位比奇异"重"：奇异只说明底座那一维没有唯一解（位置没变），
-     * 钳位意味着实际姿态和你要的**不一样**了。两个同时成立时报钳位。 */
+    /* ★ 2026-11-24：0x34 越限**拒绝**，不再“钳位后照边界走”。
+     * 逆解出的关节角越限，说明这个末端目标本身就在关节空间外；静默钳位会
+     * 让末端偏出几十度（实测可到 ~80°），却回 0x05/0x00 说“已执行”。
+     * 0x20 保留钳位语义（T3 明确要“被钳位”），0x34 是 A1 的取点入口，宁可不动。
+     * 注意这里只判不改：不能先 store 再发现越限，s_tgt_x10 已经脏了。 */
+    limited = q_any_out_of_limit(q_in);
     if (limited != 0u)
     {
-      code = PROTO_CART_LIMITED;
+      code = PROTO_CART_LIMITED;     /* 没动，手臂保持原位 */
+    }
+    else
+    {
+      (void)store_q_x10(q_in);       /* 和 0x20 走同一道限位闸 */
+      commit_target(get_u16(&fr->payload[6]), fr->payload[8]);
     }
   }
 
@@ -868,20 +915,38 @@ static void on_mode(const proto_frame_t *fr)
   {
     return;
   }
+  /* 故障态下只认 0x21=3。原来 0/1/2 照改模式：0x21=2 还会亮 bit1、把
+   * s_tgt_x10 改成 home 却动不了，上位机看到“正在回零”却永远不动，
+   * 与附件一 §4.4「仅允许 0x21 填 3 复位」直接冲突。 */
+  if (((s_fault != 0u) || (s_sensor_fault != 0u)) &&
+      (fr->payload[0] != PROTO_MODE_CLEAR_FAULT))
+  {
+    return;
+  }
 
   switch (fr->payload[0])
   {
     case PROTO_MODE_MANUAL:
       s_mode = PROTO_MODE_MANUAL;
+      /* 切模式那一刻重置“收到目标”计时：s_ms_target_rx 只在 commit_target()
+       * 里刷新，手动待久一点再进 AUTO，bit5 会当帧就亮（不是 3 秒后）。 */
+      s_ms_target_rx = HAL_GetTick();
+      s_to_target    = 0u;
       break;
 
     case PROTO_MODE_AUTO:
       s_mode = PROTO_MODE_AUTO;
+      s_ms_target_rx = HAL_GetTick();
+      s_to_target    = 0u;
       break;
 
     case PROTO_MODE_HOMING:
       s_mode      = PROTO_MODE_HOMING;
       s_ms_homing = HAL_GetTick();
+      s_ms_target_rx = HAL_GetTick();   /* 同 MANUAL/AUTO：回零不是“没收到目标” */
+      s_to_target    = 0u;
+      s_limit_hit    = 0u;              /* 回零不走 store_q_x10，越界位要在这里清，
+                                         * 否则 bit2 会粘着上一次的越界 */
       for (j = 0u; j < ARM_JOINT_NUM; j++)
       {
         s_tgt_x10[j] = (int16_t)((int16_t)g_arm_joint[j].deg_home * 10);
@@ -1296,21 +1361,30 @@ void proto_app_poll(void)
 
 #else
 
-    /* ===== 宽容模式（调试期，MPU6050_REQUIRED == 0）=====
-     * 传感器**不是**必需件：只上报 bit4，**不锁运动**。
-     *
-     * ★★ 重点看这里（2026-11-15 改）★★
-     *   原来的行为：只要本次上电成功读到过一次（s_ever_ok=1），
-     *   之后线一抖就置 s_sensor_fault，而 move_start() / on_debug_pulse()
-     *   都会因此直接 return ⇒ **整条调试链被一根杜邦线堵死**，
-     *   还得反复按 RESET（一按 USB 就重枚举、上位机掉线）才能解开。
-     *
-     *   但 T1/T2/T3 根本不看倾角 —— 只有 T4 需要。
-     *   所以"没装/没焊死传感器"不该妨碍调舵机。
-     *
-     * ★ 要恢复严格模式：把 mpu6050.h 的 MPU6050_REQUIRED 改成 1 即可，
-     *   这里会自动走上面的分支，**一个字都不用动**。 */
-    s_sensor_fault = 0u;
+    /* ===== MPU6050_REQUIRED == 0：只放宽“从来没连上”这一种情况 =====
+     * ★ 2026-11-24：宽容模式也必须“丢线就停 + 置 bit2”。
+     *   原实现只置 bit4、不锁运动，于是 T4 的验收「拔 SDA 后 1 秒内停止并
+     *   上报故障」在提交的默认配置（REQUIRED=0）下根本不成立 —— 这是逻辑
+     *   与任务书冲突，不是调试口味问题。
+     *   为什么放宽不会挡调舵机：mpu6050_faulted() 已经区分了两种情况
+     *     · 从没连上 + REQUIRED=0 → f=0（不拦 T1/T2/T3）
+     *     · 连上过又丢线         → f=1（下面与严格模式同样的动作）
+     *   恢复仍自动：f=0 就清 s_sensor_fault；但不会自己接着跑，必须等新的
+     *   0x20 —— 拔插一次不会让手臂冲向几分钟前的旧目标。
+     *   REQUIRED 现在只决定“没装模块时是否一上电就锁臂”。 */
+    if (f != 0u)
+    {
+      if (s_sensor_fault == 0u)
+      {
+        s_sensor_fault = 1u;
+        s_moving       = 0u;
+        arm_joint_hold_position();
+      }
+    }
+    else
+    {
+      s_sensor_fault = 0u;
+    }
 
 #endif
   }
@@ -1372,12 +1446,30 @@ void proto_app_poll(void)
   /* 2) 插补节拍 5ms（200Hz）—— 任务书 T2 的硬指标。
    *    ★ 这里**不出帧**，只管把四个关节的目标往前推一小步。
    *    顺序仍是"先插补、再执行层"：反了的话执行层用的是上一拍的旧目标。 */
-  if ((now - s_ms_interp) >= ARM_INTERP_TICK_MS)
+  if ((int32_t)(now - s_ms_interp) >= (int32_t)ARM_INTERP_TICK_MS)
   {
-    s_ms_interp = now;
+    uint8_t n;
 
-    interp_tick(now);      /* ① 算出这一拍四个关节各自该到哪 → 设定目标 */
-    arm_joint_tick(now);   /* ② 底座闭环跑一次，写脉宽（位置型在这里没事干） */
+    /* ★ 2026-11-24：用 += 而不是 = now，最多补 3 拍。
+     * `= now` 每一拍都把相位往后推一个轮询余量，实测平均 5.1~5.3ms（≈190Hz），
+     * T2 的 200Hz 没有余量；而且一次长阻塞后下一拍会“吃掉”整段位移。
+     * 补拍上限 3：真落后太多（日志/UART 卡住）时宁可丢拍追平，不要在一个
+     * 主循环里堆十几拍 I²C 读角。 */
+    for (n = 0u; n < 3u; n++)
+    {
+      s_ms_interp += ARM_INTERP_TICK_MS;
+      interp_tick(s_ms_interp);      /* ① 算出这一拍四个关节各自该到哪 */
+      arm_joint_tick(s_ms_interp);   /* ② 底座闭环跑一次，写脉宽 */
+
+      if ((int32_t)(now - s_ms_interp) < (int32_t)ARM_INTERP_TICK_MS)
+      {
+        break;
+      }
+    }
+    if ((int32_t)(now - s_ms_interp) >= (int32_t)ARM_INTERP_TICK_MS)
+    {
+      s_ms_interp = now;             /* 落后超过 3 拍：追平，不再补 */
+    }
   }
 
   /* 2.5) 上报节拍 20ms（50Hz）—— 和插补拆开，帧率不跟着插补一起涨（那会淹没 CDC）。

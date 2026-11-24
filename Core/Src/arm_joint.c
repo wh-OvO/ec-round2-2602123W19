@@ -61,6 +61,7 @@ static uint8_t s_manual[ARM_JOINT_NUM];    /* 1 = 被 0x31 手动占用，闭环
 static arm_pid_t s_pid[ARM_JOINT_NUM];     /* 每个关节一个 PID 实例（只有 VEL 会真用） */
 
 static uint8_t s_base_fault;               /* 1 = AS5600 读不到 */
+static float   s_base_last_deg;            /* 最近一次**成功**读到的机械角（度），读失败时对外就报它 */
 static float   s_base_err;                 /* 最近一次闭环误差的绝对值（度），给状态位用 */
 static uint8_t s_read_fail_cnt;            /* 底座**连续**读失败次数，见 BASE_READ_FAIL_RESET_CNT */
 
@@ -106,6 +107,11 @@ static uint8_t base_read_deg(float *deg)
 
   if (as5600_read_deg(&raw) == 0u)
   {
+    /* ★ 2026-11-24：读失败必须**在这里**就置故障。
+     * 原来只有 vel_tick() 置位、本函数只返回 0，于是 status / move_start /
+     * 0x34 这几条在 vel_tick 之前读角度的路径会拿到「上次的值或哨兵」却
+     * 查不到故障，把坏读数当真的用。故障位现在与「这一次读成功没有」同步。 */
+    s_base_fault = 1u;
     return 0u;                       /* 读失败：*deg 保持不动，调用方自己判断 */
   }
 
@@ -115,7 +121,8 @@ static uint8_t base_read_deg(float *deg)
   raw *= (float)(1u << ARM_BASE_RAW_SHIFT);
 
   /* 区间中点，只用来把 wrap180 的 (-180,+180] 平移到标定表的区间上。
-   * J1 现在 2~312 ⇒ center = 157；接缝落在 157±180 = −23/337，离两端各 25°。 */
+   * J1 现在 −180~+145 ⇒ center = **−17.5**；接缝落在 CENTER±180×SCALE
+   * = −257.5/+222.5，离两端各 77.5°。（2~312/157 是旧坐标系，已作废。） */
   center = 0.5f * ((float)c->deg_min + (float)c->deg_max);
 
   /* 机械角 = wrap180( SIGN × (原始角 − ZERO) ) + CENTER
@@ -138,7 +145,7 @@ static uint8_t base_read_deg(float *deg)
    *   ⚠️ SCALE 必须乘在 wrap180 **之后**：折返要在"原始磁角度"空间里做，
    *      先缩放再折返的话接缝会跑到 ±180/SCALE 上去，整个标定都错位。
    *   接了 SCALE 之后接缝落在 CENTER ± 180×SCALE：
-   *      −22.5 ∓ 240 = **−262.5 / +217.5**，离行程 [−180, +135] 两头各剩 82°。
+   *      −17.5 ± 240 = **−257.5 / +222.5**，离行程 [−180, +145] 两头各剩 77.5°。
    */
 #if ARM_BASE_DIAG_RAW
   /* ===== 临时诊断（2026-11-17 夜，会话 F）=====
@@ -153,6 +160,8 @@ static uint8_t base_read_deg(float *deg)
          * ARM_BASE_DEG_SCALE + center;
 #endif
 
+  s_base_last_deg = *deg;            /* 只有读成功才更新"最后一次好值" */
+  s_base_fault    = 0u;
   return 1u;
 }
 
@@ -233,36 +242,32 @@ static void vel_tick(uint8_t joint)
   {
     float m = meas;
 
-    if (m < (float)c->deg_min) { m = (float)c->deg_min; }
-    if (m > (float)c->deg_max) { m = (float)c->deg_max; }
+    /* ★ 2026-11-24：夹到“行程 ± ARM_LIMIT_OVERSHOOT_DEG”，不再夹回行程内。
+     * 夹回行程内会把“目标 145、实测 150”算成 err = 0 → 停在限位外侧回不来，
+     * bit3 还报“已到位”。接缝在 −257.5/+222.5，留 10° 带宽仍离接缝 67°。 */
+    if (m < ((float)c->deg_min - ARM_LIMIT_OVERSHOOT_DEG))
+    {
+      m = (float)c->deg_min - ARM_LIMIT_OVERSHOOT_DEG;
+    }
+    if (m > ((float)c->deg_max + ARM_LIMIT_OVERSHOOT_DEG))
+    {
+      m = (float)c->deg_max + ARM_LIMIT_OVERSHOOT_DEG;
+    }
 
     err = s_tgt_deg[joint] - m;
   }
   s_base_err = (err >= 0.0f) ? err : -err;
 
-  /* ---- ③ 软件限位 -------------------------------------------------------
-   * 目标已经被 proto_app.c 钳在 [deg_min, deg_max] 内，所以正常情况
-   * **不可能**"想开到区间外"。能跑到区间外的只剩一种：滑行过冲。
+  /* ---- ③ 软件限位：这里**不再**重复判停 -------------------------------
+   * 目标已由 proto_app.c 的 store_q_x10() 钳进 [deg_min, deg_max]，
+   * 所以 err 永远指向行程内侧；一旦滑行过冲，PID 自己就会往回拉。
    *
-   * 接缝（wrap180 折返处）落在 **CENTER ± 180** —— 现在是 −23 / 337，
-   * 也就是"旧 home 往两侧各转 180°"那两个机械柱子。读数在接缝处会从
-   * 337 折成 −23，于是"顶在 2 侧"（读数 2 左右）和"顶在 312 侧"（读数 312
-   * 左右）的手臂，一旦过冲越过接缝，**光看 err 的符号分不出来**。
-   *
-   * 所以判据改成：误差小（≤1°，说明目标就在手边）且方向朝外才停。
-   *   · 误差大 ⇒ 目标还在区间里，不管读数落在接缝哪一侧都放行；
-   *     否则骑在柱子上会因为读数折到 +180 而永远拉不回来（死锁）。
-   *   · 误差小 ⇒ u = Kp·e 本来就 ≤3µs，早进舵机死区了，
-   *     停不停效果一样，停一下还省得在柱子上嗡嗡。 */
-  if ((s_base_err <= 1.0f) &&
-      (((meas <= (float)c->deg_min) && (err < 0.0f)) ||
-       ((meas >= (float)c->deg_max) && (err > 0.0f))))
-  {
-    arm_pid_reset(&s_pid[joint]);    /* 顶在限位上时积分不能继续涨（否则一走开就猛冲） */
-    us_stop = (c->us_stop != 0u) ? c->us_stop : SERVO_US_MID;
-    (void)arm_set_us(joint, us_stop);
-    return;
-  }
+   * 旧代码在这里判“读数顶在限位上且误差朝外 → 停”，但两个分支都不可达：
+   *   目标 ≤ deg_max、读数 ≥ deg_max ⇒ err = tgt − meas ≤ 0，永远不满足 err > 0；
+   *   内端对称。真正让它停住的是上面的死区，判据只是看着像在工作。
+   * 更糟的是 ② 若把读数夹回行程内，“目标 = 145、实测 = 150”会算出 err = 0，
+   * 手臂停在限位外侧既不动也不报 bit3 —— 现在 ② 只夹到 ±10° 带宽，不会发生。
+   * 删掉后行为不变（分支本来就进不去），只少一段误导性注释。 */
 
   /* ---- ④ PID 一拍 ------------------------------------------------------
    *
@@ -388,24 +393,31 @@ float arm_joint_get_deg(uint8_t joint)
       return d;                      /* 真实测量值（已是机械坐标系） */
     }
 
-    /* ★★★ 2026-11-17 夜改：兜底绝不能再返回目标值 ★★★
+    /* ★★★ 2026-11-24：读失败返回「上一次成功值」，故障位已在 base_read_deg() 置上 ★★★
      *
-     * 原来这里是 `return s_tgt_deg[joint];`，后果是**把"读失败"彻底藏起来**：
-     *   磁铁转 → 读失败 → 报的还是上一次成功读到的值（或目标值）
-     *   → 上位机「实际」纹丝不动 / 只偶尔跳一下
-     *   → 看起来像"传感器不跟转角"，其实是读一次失败一次。
-     * 今晚为了追这个坑绕了三个小时，就是被这行骗的。
+     * 历史（2026-11-17）：这里曾返回 s_tgt_deg[joint]（目标值），把"读失败"彻底
+     * 藏起来 —— 磁铁在转、上位机「实际」纹丝不动，追了三小时。后来改成返回
+     * −100（有磁铁但这一拍 NACK）/ −200（探不到磁铁）当诊断哨兵。
      *
-     * 诊断期把失败换成**肉眼能认出来的数**，上位机「实际」会直接显示：
-     *     -100.0 → 磁铁在场（MD=1），但这一次 I²C 读失败了 → 总线问题
-     *     -200.0 → 探测不到磁铁（MD=0）              → 磁铁 / 气隙问题
+     * 但哨兵在 2026-11-24 复查里被证明更危险：
+     *   · −100 本身是**合法角度**，0x10 里看不出异常（−200 又超出协议 ±180）；
+     *   · proto_app.c 的 move_start 把它当插补起点 → 第一拍误差 ~100° → u 顶到
+     *     ±200µs 全速反甩，等下一拍读回来再折返 —— 是真实的错误动作，不只显示问题。
      *
-     * 正式版要改成"返回上一次成功读到的值"并额外上报故障计数，
-     * 但**任何情况下都不能把目标值当实测值返回**。 */
-    return (as5600_present() != 0u) ? -100.0f : -200.0f;
+     * 现在：返回 s_base_last_deg（最后一次成功值）；故障由 bit2 / base_fault 表达，
+     * 原始磁角度仍可看 0x30。**任何情况下都不返回目标值**这条铁律不变。
+     * 代价：单拍 NACK 时 0x10 的 act 最多旧 5ms，可接受。 */
+    return s_base_last_deg;
   }
 
   return arm_get_deg(joint);         /* 位置型：CCR 反算 */
+}
+
+float arm_joint_get_deg_cached(void)
+{
+  /* 只给 50Hz 状态帧用：不碰 I²C，拿 vel_tick() 最近一次读成功的值。
+   * 目的很具体 —— 上报不能占 5ms 插补拍的预算（一次读超时就是 2ms）。 */
+  return s_base_last_deg;
 }
 
 uint16_t arm_joint_get_us(uint8_t joint)

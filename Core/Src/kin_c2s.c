@@ -47,6 +47,16 @@ uint8_t kin_c2s_deg(const kin_c2s_in_t *xyz,
     return KIN_C2S_FAIL;
   }
 
+  /* NaN / Inf 守卫：协议层是 int16，正常进不来；但 0x34 的调用链里还有
+   * cur_theta（浮点）和以后可能的其它入口。NaN 会一路穿过 sqrtf/atan2f，
+   * 最后变成“解出来的关节角也是 NaN”，而 NaN 与任何数比较都为假，
+   * 限位、可达性、奇异判定会全部放行 —— 必须在入口挡住。 */
+  if ((isfinite(xyz->x_mm) == 0) || (isfinite(xyz->y_mm) == 0) ||
+      (isfinite(xyz->z_mm) == 0) || (isfinite(cur_theta_deg) == 0))
+  {
+    return KIN_C2S_FAIL;
+  }
+
   /* ① 水平投影半径 */
   r = sqrtf((xyz->x_mm * xyz->x_mm) + (xyz->y_mm * xyz->y_mm));
 

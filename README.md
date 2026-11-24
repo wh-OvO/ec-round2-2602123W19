@@ -4,7 +4,7 @@
 USB CDC 上报与上位机联调全部在本仓库内完成。
 
 - 对应任务：**T0** 板级自检 · **T1** 单轴 PWM · **T2** 多轴联动与插补 · **T3** 标定与限位保护 · **T4** I²C 姿态检测 · **T5a** CDC 虚拟串口
-- 选做项 **T5b（Custom HID）/ T6（四态状态机）/ A1（逆解）/ A2（自制手柄）** 未实现，默认砍
+- 选做项：**A1（0x34 笛卡尔逆解）已实现**；T5b（Custom HID）/ T6（四态状态机）/ A2（自制手柄）未实现
 - **AI 使用记录见 [AI.MD](AI.MD)**（按任务书附件三规范）
 
 ---
@@ -13,7 +13,7 @@ USB CDC 上报与上位机联调全部在本仓库内完成。
 
 | 项 | 型号 / 参数 |
 |---|---|
-| 主控 | 野火 **STM32F103C8T6** 核心板（双 USB 款），Cortex-M3 @ 72 MHz，**无 FPU** |
+| 主控 | **STM32F103C8T6 Blue Pill 最小系统板**，Cortex-M3 @ 72 MHz，**无 FPU**（2026-11-15 起；野火双 USB 板 3.3V 实测 4.63 V，超绝对最大值，已停用） |
 | 时钟 | HSE 8 MHz × 9 = 72 MHz，USB 48 MHz，FLASH_LATENCY_2 |
 | 舵机 J1 底座 | SG90 改 **360° 连续旋转**（无内置位置环，靠 AS5600 外挂闭环） |
 | 舵机 J2 / J3 | MG90S（位置型，内置 PID） |
@@ -31,12 +31,12 @@ USB CDC 上报与上位机联调全部在本仓库内完成。
 | J2 大臂 PWM | **PB3** | TIM2_CH2 | 全重映射；出厂是 JTDO |
 | J3 小臂 PWM | **PB10** | TIM2_CH3 | 装反了对调 µs 值即可，不改代码 |
 | J4 夹爪 PWM | **PB11** | TIM2_CH4 | 行程 0~120°，见 `arm_cfg.c` |
-| I²C1 SCL | **PB6** | I²C1 400 kHz | MPU6050 与 AS5600 共用 |
-| I²C1 SDA | **PB7** | I²C1 400 kHz | 同上 |
-| RGB 灯 | **PA1 / PA2 / PA3** | GPIO 输出 | 板载，**低电平点亮** |
-| 按键 K1 / K2 | **PA0 / PC13** | GPIO 输入 | **高电平有效**（板上有外部下拉） |
-| USART1 TX / RX | **PA9 / PA10** | USART1 | 板载 CH340C，插上即可 `printf` |
-| USB DM / DP | **PA11 / PA12** | USB FS | 与串口口是两个独立 Type-C |
+| I²C1 SCL | **PB6** | I²C1（T4 要求 400 kHz，本机实测降到 100 kHz） | MPU6050 与 AS5600 共用 |
+| I²C1 SDA | **PB7** | 同上 | 同上 |
+| LED | **PA1** | GPIO 输出 | 外接 LED，**低电平点亮**；T0 的 1 Hz 闪烁 + 按键翻转 |
+| 按键 | **PA0** | GPIO 输入（下拉） | 外接按键到 3V3，**高电平有效**；PC13 未用 |
+| USART1 TX / RX | **PA9 / PA10** | USART1 | 外接 USB-TTL（CH340），115200 8N1 |
+| USB DM / DP | **PA11 / PA12** | USB FS | Blue Pill 板载 USB 口 |
 | SWDIO / SWCLK | **PA13 / PA14** | SWD | ST-Link 只接这两根 + GND，**别接它的 3.3 V** |
 
 > ⚠️ **供电**：舵机必须用独立电源（12 V → MP1584 → 5 V），与主控共地，
@@ -65,8 +65,8 @@ USB CDC 上报与上位机联调全部在本仓库内完成。
 
 | 预设 | 说明 |
 |---|---|
-| **`Debug`** | 默认，`-Og`。**FLASH 41096 B / 64 KB = 62.71%**，RAM 8248 B / 20 KB = 40.27%（2026-11-13 全量构建实测） |
-| `Release` | `-O2`，**FLASH 38692 B / 64 KB = 59.04%**，RAM 同上。用于最终烧录 |
+| **`Debug`** | 默认，`-Og`。**FLASH 45160 B / 64 KB = 68.91%**，RAM 8288 B / 20 KB = 40.47%（2026-11-24 全量构建实测） |
+| `Release` | `-O2`，**FLASH 42920 B / 64 KB = 65.49%**，RAM 同上。用于最终烧录 |
 | `RelWithDebInfo` / `MinSizeRel` | 保留预设，未做验收 |
 
 ### 3.2 命令
@@ -121,6 +121,7 @@ STM32_Programmer_CLI -c port=SWD -w build\Debug\rm_arm.elf -v -rst
 | `0x31` | 单路脉宽设定 | 上位机 → 设备 | 4 B | 调试用：绕开映射直接写 CCR |
 | `0x32` | 脉宽回读 | 双向 | 1 / 9 B | |
 | `0x33` | 陀螺零偏标定 | 双向 | 1 / 9 B | |
+| `0x34` | 笛卡尔目标（A1） | 上位机 → 设备 | 9 / 1 B | x,y,z (0.1mm) + 时长 + profile；结果是 1B 码（00 成功 / 02 不可达 / 03 底座奇异 / 04 肩轴奇异 / 05 关节越限拒绝 / 06 故障） |
 
 ### 4.2 实现分层
 
@@ -189,7 +190,12 @@ gcc -std=c11 -Wall -Wextra -Wpedantic -O2 -ffp-contract=off -I Core/Inc `
 | 测试 | 条数 | 内容 |
 |---|---|---|
 | `tests/proto_selftest.c` | 28 | CRC8 向量、组帧、流式解帧逐字节喂入、参数校验 |
-| `tests/pid_selftest.c` | 32 | **逐位回归**（`Ki=Kd=0` 时与旧纯 P 代码 52806 组输出完全一致）、死区清积分、积分限幅、抗饱和冻结、D 低通、无 setpoint kick、斜坡跟踪仿真 |
+| `tests/pid_selftest.c` | 40 | **逐位回归**（`Ki=Kd=0` 时与旧纯 P 代码完全一致）、死区清积分、积分限幅、抗饱和冻结、D 低通、无 setpoint kick、斜坡跟踪仿真 |
+| `tests/scs_selftest.c` | 33 | 球坐标逆解 / 正解互验、可达边界、除零保护 |
+| `tests/ccs_selftest.c` | 16 | 逆解与 kin_scs 交叉验证（需同时链接 `kin_scs.c`） |
+| `tests/c2s_selftest.c` | 53 | 笛卡尔 → 球坐标 9 个点（含两个奇点） |
+| `tests/cart_chain_selftest.c` | 1622 | 0x34 全链路（c2s → ccs → scs）网格扫描 |
+| `tests/pid_loop_sim.c` | 8 组 | 闭环仿真：进 ±2° 时间 / 过冲 / 20 s 残差（Ki=1.0 残差 1.46°） |
 
 退出码 `0` = 全过。
 
@@ -221,14 +227,17 @@ gcc -std=c11 -Wall -Wextra -Wpedantic -O2 -ffp-contract=off -I Core/Inc `
 
 ## 9. 已知限制（如实记录）
 
-1. **底座 J1 仍按位置型（`ARM_JOINT_POS`）运行**：360° 舵机 + AS5600 尚未安装，
-   `arm_joint.c` 的速度闭环分支（`vel_tick()`）**当前不执行**。PID 模块已就绪且
-   `Ki = Kd = 0`，对现有行为零影响，等硬件到位后标定 `ARM_BASE_ENC_ZERO_DEG` /
-   `ARM_BASE_ENC_SIGN` 再翻成速度型。
-2. **J2/J3/J4 是开环**：模拟位置舵机内部自带位置环，MCU 只负责"发对数"，
+1. **底座 J1 已是速度型闭环（`ARM_JOINT_VEL`）**：360° 舵机 + AS5600，`Ki=1.0`、
+   `Kd=0`，标定 `ZERO=178.25 / SIGN=−1 / SCALE=1.3333`（home=0、−180~+145）。
+   编码器单拍 NACK 时对外报**上一次成功角**并置 bit2/bit4，不再返回 −100/−200 哨兵。
+2. **I²C1 实际 100 kHz（任务书 T4 写 400 kHz）**：400 kHz 在 15~20 cm 杜邦线上
+   偶发 NACK，2026-11-15 起降速；`.ioc` 仍是 Fast，代码在 USER CODE 区覆盖，
+   改回只需把 `main.c` 的 `ARM_I2C1_CLOCK_HZ` 改成 400000。**这是与任务书的已知偏差**。
+3. **J2/J3/J4 是开环**：模拟位置舵机内部自带位置环，MCU 只负责"发对数"，
    不构成外部闭环（也不应该在外部再套一层位置环）。
-3. **J4 夹爪分辨率**：该路 1 µs 脉宽 ≈ 1.2°，协议 0.1° 精度在这一路无效。
-4. **合测**：四路舵机同时驱动需要独立电源（MP1584 → 5 V），USB 供电只够空载单路。
+4. **J4 夹爪分辨率**：该路 1 µs 脉宽 ≈ 1.2°，协议 0.1° 精度在这一路无效。
+5. **合测**：四路舵机同时驱动需要独立电源（12 V → buck → 5 V），USB 供电只够空载单路；
+   舵机与主控**必须共地**。
 
 ---
 
