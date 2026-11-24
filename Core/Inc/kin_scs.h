@@ -130,6 +130,21 @@ void kin_scs_reach(float *d_min, float *d_max);
 uint8_t kin_scs_solve(const kin_scs_tgt_t *tgt, kin_scs_out_t *out);
 
 /**
+  * @brief  把 j1_deg（norm360 的 0~360）绕回机械坐标系的 −180 ~ +180
+  * @param  deg  任意角度
+  * @retval 落在 **[−180, 180)** 的等价角
+  *
+  * @note   **必须在进限位闸之前调**（2026-11-24 接 0x34 时差点踩的雷）：
+  *           kin_scs_solve() 输出的 j1_deg 是 0~360，而 arm_cfg.c 里
+  *           J1 是 −180~+135。不绕的话 θ=330°（即 −30°）会被钳成 135°，
+  *           底座反着跑一大截，**而且不报错**。
+  *
+  * @note   用**左闭右开**：+180 绕成 −180。同一个方向，但本机 −180 够得到、
+  *         +180 够不到（deg_max = 135），所以只能表示成 −180。
+  */
+float kin_scs_wrap180(float deg);
+
+/**
   * @brief  正解：关节角 → 3D 点（原点 = 肩轴心，x 向前、y 向左、z 向上）
   * @note   给单测做往返校验用，也方便把"解出来的姿态"算回末端做可视化。
   *

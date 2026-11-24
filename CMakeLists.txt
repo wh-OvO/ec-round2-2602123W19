@@ -93,6 +93,7 @@ add_library(arm_servo STATIC
     Core/Src/as5600.c         # T2: 底座角度反馈（AS5600 磁编码器）
     Core/Src/kin_scs.c        # A1: 球坐标逆解 SCS（(θ,d,α) → J1/J2/J3），验收走这个
     Core/Src/kin_ccs.c        # 对照: 笛卡尔逆解 CCS（(x,y,z) → J1/J2/J3），独立库
+    Core/Src/kin_c2s.c        # A1: 笛卡尔 → 球坐标 的纯变换（0x34 入口要走这一步）
 )
 # arm_joint.c 的 vel_tick() 会调 arm_pid_step()，所以这个依赖得传出去。
 # ★ 必须写在 add_library(arm_pid ...) 之后：放在前面的话 CMake 会把它当成

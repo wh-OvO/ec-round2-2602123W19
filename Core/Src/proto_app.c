@@ -37,14 +37,47 @@
 #include "arm_pwm.h"
 #include "arm_joint.h"      /* T2: 关节执行层（底座闭环 / 其余直通） */
 #include "mpu6050.h"        /* T4: 姿态传感器（pitch / 0x30 / 0x33） */
+#include "kin_scs.h"        /* A1: 球坐标逆解（(θ,d,α) → J1/J2/J3），验收走这套 */
+#include "kin_c2s.h"        /* A1: 笛卡尔 → 球坐标 的变换（0x34 入口的第一段） */
 
-/* ---- 时间参数 ---- */
-#define APP_REPORT_MS        20u     /* 状态帧周期：20ms = 50Hz（正本要求 20~50Hz） */
+/* ---- 时间参数 ----
+ *
+ * ★ 2026-11-24 接完 0x34 之后回头把这一块逐个重核了一遍，每个数都补了"为什么是它"。
+ *   以前这里只有一句"状态帧周期 20ms"，看的人不知道能不能改、改坏了会怎样。
+ *
+ *   APP_REPORT_MS          50Hz，正本要求 20~50Hz。上限卡 50Hz 是因为 CDC 是单缓冲，
+ *                          再快就有丢帧风险；而 0x10 才 19B，50Hz 看曲线足够了。
+ *                          下面两个 #error 强制它是 ARM_INTERP_TICK_MS 的整数倍。
+ *   APP_HB_TX_MS           我们自己发心跳 1Hz。对端判超时是 3s，等于连丢 3 个才报，
+ *                          不会因为一次 USB 抖动就误报故障。
+ *   APP_TGT_TIMEOUT_MS     正本 §5：3 秒没收到 0x20 → bit5。只在**非手动**模式判
+ *                          （手动模式本来就不该有连续目标流，按字面判会一进手动就报超时）。
+ *   APP_HB_TIMEOUT_MS      正本 §5：3 秒没收到心跳 → bit5。
+ *   APP_HOMING_SHOW_MS     只干一件事：让 0x10 的 bit1「正在回零」**至少亮 500ms**，
+ *                          否则自动回零在 50Hz 的上位机上看就是闪一下，人眼看不见。
+ *                          ⚠️ 它**不是**"回零要多久"——回零时长是 arm_cfg.h 的
+ *                          ARM_HOMING_MS（800ms），两者别混。
+ *                          ⚠️ 它**也不是**"回零完成"的判据：完成条件是"插补停了 &&
+ *                          执行层也不动了"（见 proto_app_poll() 的 1.6 段），时间只是下限。
+ *                          ⚠️ 老注释写的"无编码器，只能估"已经过时：底座现在有 AS5600
+ *                          在实测；但 J2/J3/J4 是**位置型**关节，它们的"实测角"其实
+ *                          是 CCR 反算出来的，并不比命令值多一个 bit 的信息 ——
+ *                          所以整体仍然谈不上"闭环到位"，这个下限该留。
+ *   APP_BOOT_HOME_DELAY_MS 上电后等 500ms 再自动回零（T3）。等的是三件事：
+ *                          ① AS5600 上电 + I²C1 第一次读数稳定（读不到会返回 −100/−200 哨兵）
+ *                          ② 位置型关节的脉冲已经由 arm_pwm 的 power_on_us() 先写成零位了，
+ *                             再等一拍让它真的到位
+ *                          ③ USB 枚举完，别在上位机还没连上时自己先动起来
+ *                          底座那一路是 VEL 关节（360° 连续舵机），回零靠 PID 去追，
+ *                          所以"500ms 之后**开始**" ≠ "500ms 之后**到位**"，
+ *                          到位由 800ms 的插补保证。
+ */
+#define APP_REPORT_MS        20u      /* 状态帧周期：20ms = 50Hz（正本要求 20~50Hz） */
 #define APP_HB_TX_MS         1000u    /* 我们自己发心跳的周期：1Hz */
 #define APP_TGT_TIMEOUT_MS   3000u    /* 正本 §5：3 秒没收到 0x20 */
 #define APP_HB_TIMEOUT_MS    3000u    /* 正本 §5：3 秒没收到心跳 */
-#define APP_HOMING_SHOW_MS   500u     /* bit1"正在回零"至少显示这么久（无编码器，只能估） */
-#define APP_BOOT_HOME_DELAY_MS 500u   /* T3：上电后等这么久再自动回零（让舵机先稳住） */
+#define APP_HOMING_SHOW_MS   500u     /* bit1「正在回零」至少亮这么久（**不是**回零时长） */
+#define APP_BOOT_HOME_DELAY_MS 500u   /* T3：上电后等这么久再自动回零 */
 
 /* 插补和上报现在是**两个独立节拍**，不再是同一个 20ms。
  *
@@ -171,75 +204,33 @@ static int16_t to_x10(float deg)
 }
 
 /* ------------------------------------------------------------------------- */
-/* J1 坐标换算：上位机 ±180  ⇄  固件 CENTER±180                               */
+/* J1 坐标换算：**没有了** —— 上位机和固件现在是同一个坐标系                  */
 /* ------------------------------------------------------------------------- */
 
-/* 2026-11-20 起底座坐标系从 ±180 改成 0~360（理由见 arm_cfg.c 的 J1 注释）。
- * 固件里的读数是
+/* 2026-11-23 20:10：J1 的限位改成 **home = 0、−180 ~ +135**（见 arm_cfg.c），
+ * 这一改直接把换算层消掉了：
  *
- *     fw = wrap180( SIGN × (raw − ZERO) ) + CENTER,   CENTER = (deg_min+deg_max)/2
+ *     上位机 −180  ←→  固件 −180  ←→  一端的机械柱
+ *     上位机    0  ←→  固件    0  ←→  home
+ *     上位机 +135  ←→  固件 +135  ←→  另一端的机械柱（离整圈还差 45°）
  *
- * 所以 **fw − CENTER 恰好就是上位机原来那个 ±180 坐标**（0 = 旧 home =
- * 手臂朝正前方）。换算就是把 CENTER 这个偏移量加减回去，两边语义完全对得上：
+ * 两边字节语义完全一致，所以 send_status() 直接把 arm_joint_get_deg(0) 和
+ * s_tgt_x10[0] 原样填进 0x10 帧，on_target() 也原样收，不做任何加减。
+ * 线协议一个字节都没动，ArmHost 那边不用改。
  *
- *       上位机   −155 ──────── 0 ──────── +155        （超出部分会被钳位）
- *       固件        2 ─────── 157 ─────── 312
- *                deg_min    CENTER    deg_max
+ * 历史（别再走回头路）：
+ *   · 11-20 ~ 11-21：底座坐标系是 0~360，靠 `fw − CENTER` 平移成上位机的 ±180。
+ *     CENTER = (deg_min+deg_max)/2，改一次限位就得跟着改一次，还容易漏。
+ *   · 11-21 22:55：试过"按比例铺满 ±180"，显示角比真实角小 13.9%，被否掉
+ *     （用户：「按比例映射，不如不映射」）。
+ *   · 11-21 23:10：试过"上位机 + 180 = 固件"，home 落在 −180。能用，但别扭。
+ *   · 11-23 20:10：**把 home 放回 0**，限位 −180/+135，行程 315° 正好塞进
+ *     上位机的 ±180 —— 换算层彻底不需要了。
  *
- * ⚠️ CENTER 必须**从标定表算**，不能写死 —— 上限从 358 → 320 → 312 一路降，
- *    CENTER 就跟着 180 → 161 → 157。写死会把上位机的 0 点整体挪走好几度，
- *    而且改上限的人根本想不到这里还有一份拷贝。
+ * ⚠️ 只剩 ARM_BASE_ENC_ZERO_DEG（arm_cfg.h）还带坐标系语义：
+ *    改 deg_min/deg_max（CENTER 跟着变）就必须按那里的 ①② 重算 ZERO。
  *
- * **换算放在设备端，线协议一个字节都没动** —— ArmHost 不用改，旧版本上位机
- * 也照样能用（它发 0 还是"回正前方"）。
- *
- * ⚠️ 只对 J1（下标 0）。J2/J3/J4 是位置型关节，坐标系没变，绝不能一起加，
- *    否则那三路会整体偏 157°，一上电就撞限位。 */
-
-/* ---- J1 上位机 ←→ 固件 的角度换算 ---------------------------------------
- *
- * ★ 2026-11-21 23:10 定案（用户拍板，原话）：
- *   「-180 -> home; -180~0 -> home~180; 0~180 -> 180~360, 限位到 315 解决一切问题」
- *
- *     上位机 −180  →  固件 0    →  机械 home（顶住柱子）
- *     上位机    0  →  固件 180  →  行程中点
- *     上位机 +135  →  固件 315  →  撞点，到头
- *     上位机 +180  →  固件 360  →  被 deg_max = 315 钳住
- *
- * 也就是 `固件 = 上位机 + 180`，**纯平移、不缩放** —— 上位机的 1° 就是真 1°。
- *
- * 上一版是 `host = fw − CENTER`（CENTER = (2+312)/2 = 157），对齐的是"行程中点 = 0"，
- * 结果上位机只能到 ±155，+180 被钳成 +155；再上一版更糟，是"按比例铺满"，
- * 虽然 ±180 都能用到，但显示角比真实角小 13.9% —— 用户一句「按比例映射不如不映射」
- * 毙掉了。这一版两头都不占：不缩放，home 又正好落在 −180。
- *
- * ⚠️ 上位机的 +136~+180 一律钳在 315（行程真的到头了），这是机械决定的，不是 bug。 */
-#define J1_HOST_OFFSET_X10   1800     /* 180.0°，单位 0.1° */
-
-/* 故障哨兵：arm_joint.c 底座读失败返回 −100°、永久失效 −200°，
- * 在 0.1° 下是 −1000 / −2000。正常读数下界是 0°，噪声最多到 −5° 左右，
- * 所以 −500 这个门限分得开。 */
-#define J1_SENTINEL_X10      (-500)
-
-/* 上位机 → 固件。只用在 on_target() 取到原始目标之后、钳位之前。 */
-static int32_t j1_to_fw_x10(uint8_t j, int32_t q)
-{
-  return (j == 0u) ? (q + J1_HOST_OFFSET_X10) : q;
-}
-
-/* 固件 → 上位机。只用在 send_status() 拼 0x10 的时候。
- *
- * 故障哨兵**原样透传** —— 减 180 会变成 −280 / −380，上位机就认不出
- * "传感器坏了"了，只会当成一个离谱的角度画到图上。 */
-static int16_t j1_to_host_x10(uint8_t j, int16_t q)
-{
-  if ((j != 0u) || ((int32_t)q < J1_SENTINEL_X10))
-  {
-    return q;
-  }
-
-  return (int16_t)((int32_t)q - J1_HOST_OFFSET_X10);
-}
+ * ⚠️ 只对 J1 有过这套东西。J2/J3/J4 是位置型关节，0~180，从来没参与换算。 */
 
 /* ------------------------------------------------------------------------- */
 /* 状态位组装（正本 §4.2）                                                   */
@@ -299,12 +290,12 @@ static void send_status(uint32_t now)
   {
     /* 走关节层而不是 arm_pwm：
      * 底座会读 AS5600 报真实角度，其余三路仍是 CCR 反算。
-     * J1 走 j1_to_host_x10 换成上位机的 −180~+180（故障哨兵原样透传）。 */
-    put_i16(&pl[(uint16_t)j * 2u], j1_to_host_x10(j, to_x10(arm_joint_get_deg(j))));
+     * J1 和上位机同坐标系（home = 0、−180~+135），原样上报。 */
+    put_i16(&pl[(uint16_t)j * 2u], to_x10(arm_joint_get_deg(j)));
   }
   for (j = 0u; j < ARM_JOINT_NUM; j++)
   {
-    put_i16(&pl[8u + (uint16_t)j * 2u], j1_to_host_x10(j, s_tgt_x10[j]));
+    put_i16(&pl[8u + (uint16_t)j * 2u], s_tgt_x10[j]);
   }
 
   /* 正本 §4.2：pitch 是"末端实测俯仰角"，无传感器时填 0。
@@ -616,20 +607,23 @@ static void interp_tick(uint32_t now)
 /* ------------------------------------------------------------------------- */
 /* 各消息处理                                                                */
 /* ------------------------------------------------------------------------- */
-static void on_target(const proto_frame_t *fr)
+/* ------------------------------------------------------------------------- */
+/* 四个关节角（0.1°）→ 钳位 → 写进 s_tgt_x10[] → 记限位标志                  */
+/* ------------------------------------------------------------------------- */
+/* 为什么抽成函数（2026-11-24 接 0x34 时抽的）：
+ * `0x20`（关节空间入口）和 `0x34`（笛卡尔逆解入口）最后都要落到同一件事 ——
+ * 把四个角度钳进软限位、写成唯一的目标真值并置标志。
+ * **复制一份钳位代码是绝对不能做的**：两份一旦不一致，`0x34` 那条路
+ * 就成了绕过限位的后门，而且是"看着能跑"的那种后门。
+ *
+ * 返回值 = 1 表示至少有一个轴被钳位（调用方要用它回 0x05）。 */
+static uint8_t store_q_x10(const int32_t q_in[ARM_JOINT_NUM])
 {
-  uint8_t  j;
-  uint16_t dur;
-  uint8_t  profile;
-  uint8_t  limited;
-  int32_t  q;
-  int32_t  lo;
-  int32_t  hi;
-
-  if (fr->len != PROTO_LEN_TARGET)
-  {
-    return;                          /* 长度不对直接忽略，不当成致命错误 */
-  }
+  uint8_t j;
+  uint8_t limited = 0u;
+  int32_t q;
+  int32_t lo;
+  int32_t hi;
 
   /* T3 越界钳位：取值 → 对比该关节的 [deg_min, deg_max] → 夹住 → 记标志。
    *
@@ -642,12 +636,11 @@ static void on_target(const proto_frame_t *fr)
    *
    * 用 int32_t 算：int16_t 的 deg_max 乘 10 在 180 以内不会溢出，
    * 但以后要是有人把 deg_max 改成 4000（0.1° 单位），int16_t 就会悄悄溢出。 */
-  limited = 0u;
   for (j = 0u; j < ARM_JOINT_NUM; j++)
   {
-    /* j1_to_fw_x10：J1 上位机 −180~+180 → 固件 0~360，其余关节不变。
-     * 换算必须在**钳位之前** —— 固件的 deg_min/max 是 0~360 那一套。 */
-    q  = j1_to_fw_x10(j, (int32_t)get_i16(&fr->payload[(uint16_t)j * 2u]));   /* 0.1° */
+    /* J1 和上位机同坐标系（home = 0、−180~+135），原样收，只做钳位。
+     * J2/J3/J4 本来就是 0~180，也一样。 */
+    q  = q_in[j];
     lo = (int32_t)g_arm_joint[j].deg_min * 10;
     hi = (int32_t)g_arm_joint[j].deg_max * 10;
 
@@ -666,15 +659,18 @@ static void on_target(const proto_frame_t *fr)
   }
   s_limit_hit = limited;   /* 每帧重算：下一条合法指令到达就自动清 0 */
 
-  /* 0x20 载荷：q1~q4_tgt(8B) + duration u16(2B) + profile u8(1B) */
-  dur     = get_u16(&fr->payload[8]);
-  profile = fr->payload[10];
+  return limited;
+}
 
-  /* profile 的三个取值见 proto.h「四之一」：0 阶跃 / 1 梯形 / 2 S 曲线。
-   * 以前这里写的是 (void)profile，三档全按"线性匀速"跑 —— 那是不对的：
-   * 任务书根本没定义"线性"这一档，评审一看速度曲线就露馅。
-   * 合法性检查（未知值降级成梯形）放在 move_start() 里，这里只管透传。 */
-
+/* ------------------------------------------------------------------------- */
+/* 目标写进 s_tgt_x10[] 之后的公共收尾                                        */
+/* ------------------------------------------------------------------------- */
+/* `0x20` 和 `0x34` 都要做这六件事，顺序也有讲究：
+ *   ① 退出回零态 ② 刷新"收到目标"时间戳 ③ 清超时标志 ④ 退出调试模式
+ *   ⑤ 取消还没执行的上电自动回零 ⑥ 启动插补
+ * 少做任何一条都会留下"以前能用、现在莫名其妙"的 bug，所以不许各写一份。 */
+static void commit_target(uint16_t dur, uint8_t profile)
+{
   if (s_mode == PROTO_MODE_HOMING)
   {
     s_mode = PROTO_MODE_AUTO;        /* 收到新的目标就退出回零 */
@@ -691,6 +687,177 @@ static void on_target(const proto_frame_t *fr)
   /* 重复收到同一个目标也没关系：起点=当前位置、终点=目标，
    * 走过去是 0 位移，无害。 */
   move_start(dur, profile);
+}
+
+/* ------------------------------------------------------------------------- */
+static void on_target(const proto_frame_t *fr)
+{
+  uint8_t  j;
+  uint16_t dur;
+  uint8_t  profile;
+  int32_t  q_in[ARM_JOINT_NUM];
+
+  if (fr->len != PROTO_LEN_TARGET)
+  {
+    return;                          /* 长度不对直接忽略，不当成致命错误 */
+  }
+
+  for (j = 0u; j < ARM_JOINT_NUM; j++)
+  {
+    q_in[j] = (int32_t)get_i16(&fr->payload[(uint16_t)j * 2u]);   /* 0.1° */
+  }
+  (void)store_q_x10(q_in);           /* 钳位 + 写 s_tgt_x10[] + 置 s_limit_hit */
+
+  /* 0x20 载荷：q1~q4_tgt(8B) + duration u16(2B) + profile u8(1B) */
+  dur     = get_u16(&fr->payload[8]);
+  profile = fr->payload[10];
+
+  /* profile 的三个取值见 proto.h「四之一」：0 阶跃 / 1 梯形 / 2 S 曲线。
+   * 以前这里写的是 (void)profile，三档全按"线性匀速"跑 —— 那是不对的：
+   * 任务书根本没定义"线性"这一档，评审一看速度曲线就露馅。
+   * 合法性检查（未知值降级成梯形）放在 move_start() 里，这里只管透传。 */
+
+  commit_target(dur, profile);
+}
+
+/* ------------------------------------------------------------------------- */
+/* 0x34：笛卡尔目标 → 逆解成关节角                                            */
+/* ------------------------------------------------------------------------- */
+/* 链路（用户 2026-11-24 定）：
+ *
+ *     x,y,z ──[kin_c2s]──> θ,d,α ──[kin_scs_solve]──> J1,J2,J3
+ *
+ * 三段各管各的，别混：
+ *   kin_c2s   只管坐标换算，不判可达、不限幅
+ *   kin_scs   只管几何，判"够不够得到"，**不限幅**（它自己文档写明"限幅是调用方的事"）
+ *   solve_cart 判奇点、判可达、对齐坐标系；限幅和启动插补由调用方做
+ *
+ * 返回值见 proto.h 的 PROTO_CART_* 码；只有 OK / SING_BASE 时才填了 q_out。
+ */
+static uint8_t solve_cart(const proto_frame_t *fr, int32_t q_out[ARM_JOINT_NUM])
+{
+  uint8_t  j;
+  uint8_t  st;
+  float    cur_theta;
+  float    theta = 0.0f;
+  float    d_mm  = 0.0f;
+  float    alpha = 0.0f;
+  float    d_lo  = 0.0f;
+  float    d_hi  = 0.0f;
+  float    j1;
+  float    tj[ARM_JOINT_NUM];
+  kin_c2s_in_t  xyz;
+  kin_scs_tgt_t tgt;
+  kin_scs_out_t sol;
+
+  /* ---- ① 三道闸：长度 / 故障 / 有没有标定 ---- */
+  if (fr->len != PROTO_LEN_CART)
+  {
+    return PROTO_CART_BADLEN;
+  }
+  if (s_fault != 0u)
+  {
+    return PROTO_CART_FAULT;
+  }
+  if (kin_scs_ready() == 0u)
+  {
+    /* 几何参数（L1/L2）还是 0：解出来全是胡说，宁可拒绝也不动一下。 */
+    return PROTO_CART_NOT_READY;
+  }
+
+  /* ---- ② 取当前底座角：只用于"目标落在底座转轴上"那个奇点 ---- */
+  /* AS5600 读不到时 arm_joint_get_deg() 返回 −100 / −200 哨兵，而
+   * **−100 本身是一个合法角度**，没法靠范围识别 —— 所以直接问故障位，
+   * 坏掉就用上一次的目标角兜底（那是协议层自己的值，永远可信）。 */
+  cur_theta = arm_joint_get_deg(0u);
+  if (arm_joint_base_fault() != 0u)
+  {
+    cur_theta = (float)s_tgt_x10[0] * 0.1f;
+  }
+
+  /* 0x34 载荷：x,y,z int16(0.1mm) + duration u16(2B) + profile u8(1B) */
+  xyz.x_mm = (float)get_i16(&fr->payload[0]) * 0.1f;
+  xyz.y_mm = (float)get_i16(&fr->payload[2]) * 0.1f;
+  xyz.z_mm = (float)get_i16(&fr->payload[4]) * 0.1f;
+
+  /* ---- ③ 坐标变换（内含奇点一：目标在底座转轴上）---- */
+  st = kin_c2s_deg(&xyz, cur_theta, &theta, &d_mm, &alpha);
+  if (st == KIN_C2S_FAIL)
+  {
+    /* d≈0：目标点就落在肩轴心上，仰角 α 无定义。
+     * 这不是"够不到"，是"这个问题本身没有答案" —— 末端不可能待在肩轴心上。
+     * 拒绝，**不要**硬编一个 α = 0 出来。 */
+    return PROTO_CART_SING_AXIS;
+  }
+
+  /* ---- ④ 可达性判定：先判，才能把"够不到"和"解算内部失败"分开报 ---- */
+  kin_scs_reach(&d_lo, &d_hi);
+  if ((d_mm < d_lo) || (d_mm > d_hi))
+  {
+    return PROTO_CART_UNREACHABLE;
+  }
+
+  /* ---- ⑤ 球坐标 → 关节角 ---- */
+  tgt.theta_deg = theta;
+  tgt.d_mm      = d_mm;
+  tgt.alpha_deg = alpha;
+  if (kin_scs_solve(&tgt, &sol) == 0u)
+  {
+    return PROTO_CART_UNREACHABLE;   /* 兜底：预判放过了，但几何上仍然无解 */
+  }
+
+  /* ---- ⑥ ⚠️ 坐标系对齐：这一步漏了会算错，而且不报任何错 ---- */
+  /* kin_scs_solve() 的 out->j1_deg 是 norm360(...)，范围 **0 ~ 360**；
+   * 而 arm_cfg.c 里 J1 是 **−180 ~ +135**。不绕的后果：
+   *     θ = 330°（其实就是 −30°）→ j1 = 330 → 被钳到 135° → 关节反着跑一大截。
+   * 绕回的逻辑放在 kin_scs_wrap180()（左闭右开 [−180, 180)），那里能被单测钉死，
+   * 这里不要就地再写一遍 while，两份一不一致就又是个"看着能跑"的 bug。 */
+  j1 = kin_scs_wrap180(sol.j1_deg);
+
+  tj[0] = j1;
+  tj[1] = sol.j2_deg;
+  tj[2] = sol.j3_deg;
+  /* J4 夹爪不在逆解范围内（kin_scs 只出 J1/J2/J3；用户 11-24 明确"跟 j4 没关系"）
+   * → 保持**当前命令值**不动。用 s_tgt_x10[3]（目标）而不是实测角：
+   * 位置型关节的实测角本来就是 CCR 反算，两者相等，但目标值不带噪声。 */
+  tj[3] = (float)s_tgt_x10[3] * 0.1f;
+
+  /* 浮点度 → 0.1°：直接调文件顶上的 to_x10()，别在这里再手写一遍四舍五入。
+   * （它内部已经处理了负数 —— C 的强制转换是**向零截断**，−0.46° × 10 = −4.6
+   *  会截成 −4 而正确应是 −5，直接 (int16_t)(x * 10) 在负角度附近会偏半个 LSB。） */
+  for (j = 0u; j < ARM_JOINT_NUM; j++)
+  {
+    q_out[j] = (int32_t)to_x10(tj[j]);
+  }
+
+  return (st == KIN_C2S_SING_BASE) ? PROTO_CART_SING_BASE : PROTO_CART_OK;
+}
+
+/* ------------------------------------------------------------------------- */
+static void on_cart(const proto_frame_t *fr)
+{
+  uint8_t pl[PROTO_LEN_CART_REPLY];
+  uint8_t code;
+  uint8_t limited;
+  int32_t q_in[ARM_JOINT_NUM];
+
+  code = solve_cart(fr, q_in);
+
+  if ((code == PROTO_CART_OK) || (code == PROTO_CART_SING_BASE))
+  {
+    limited = store_q_x10(q_in);     /* 和 0x20 走同一道限位闸 */
+    commit_target(get_u16(&fr->payload[6]), fr->payload[8]);
+
+    /* 钳位比奇异"重"：奇异只说明底座那一维没有唯一解（位置没变），
+     * 钳位意味着实际姿态和你要的**不一样**了。两个同时成立时报钳位。 */
+    if (limited != 0u)
+    {
+      code = PROTO_CART_LIMITED;
+    }
+  }
+
+  pl[0] = code;
+  (void)link_send_frame(PROTO_T_CART, pl, PROTO_LEN_CART_REPLY);
 }
 
 static void on_mode(const proto_frame_t *fr)
@@ -1017,6 +1184,7 @@ static void dispatch(const proto_frame_t *fr)
     case PROTO_T_PULSE_GET: on_pulse_get(fr); break;
     case PROTO_T_SENSOR_RAW: on_sensor_raw(fr); break;
     case PROTO_T_GYRO_CALIB: on_gyro_calib(fr); break;
+    case PROTO_T_CART:       on_cart(fr);       break;   /* A1: 笛卡尔逆解 */
 
     default:
       /* 未知类型：静默丢弃。正本要求"不回复"，也绝不能崩。 */

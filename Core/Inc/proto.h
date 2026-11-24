@@ -69,6 +69,42 @@ extern "C" {
 #define PROTO_T_SENSOR_RAW     0x30u   /* 传感器原始数据 双向 query 1B / reply 17B */
 #define PROTO_T_GYRO_CALIB     0x33u   /* 陀螺零偏标定   双向 cmd 1B / reply 9B */
 
+/* ---- A1 笛卡尔逆解入口（0x34）----
+ * 为什么单独一帧、不塞进 0x20：
+ *   0x20 的载荷是**四个关节角**，逆解要送的是**末端位置**，两个空间不同。
+ *   混成一条路的话，出了问题分不清是逆解算错了、还是上层把关节角填错了。
+ *
+ * 为什么入口用笛卡尔而不是球坐标（用户 2026-11-24 定）：
+ *   上位机画图、算末端位置都在笛卡尔空间里；让人手填 (θ, d, α) 反人类。
+ *   固件内部先做一步 xyz → (θ, d, α)（kin_c2s.c），再走 kin_scs 解算 ——
+ *   **中间那一步既是唯一的新代码，也正好是能单独单测的一段**。
+ *
+ * 为什么是 0x34：
+ *   正本 §4.1 只到 0x24；0x30~0x33 已被调试帧和 T4 帧占掉（见上）；
+ *   0x34 是紧接着的下一个空号。⚠️ 本工程历史注释里零星出现过的"0x25"作废。
+ */
+#define PROTO_T_CART           0x34u   /* 笛卡尔目标 上位机 → 设备；应答 1B */
+#define PROTO_LEN_CART          9u     /* x,y,z int16(0.1mm) + dur u16 + profile u8 */
+#define PROTO_LEN_CART_REPLY    1u     /* 结果码 1B */
+
+/* 0x34 应答码（1B）。
+ *
+ * 为什么要把"奇异"和"不可达"分开报（这是 A1 的硬要求）：
+ *   任务书 A1 原文「须包含可达性判定，目标不可达时**拒绝执行并上报原因**；
+ *   对**奇异位形与越限**有处理」—— 三件事都得有各自的话说，
+ *   只回一个笼统的"失败"，评审一问就答不上来。
+ *
+ * 约定：0x00 / 0x03 / 0x05 = **已经动了**（后两个带警告）；
+ *       其余 = **没动**，手臂保持原位。上位机据此决定要不要重发。 */
+#define PROTO_CART_OK            0x00u  /* 执行成功 */
+#define PROTO_CART_NOT_READY     0x01u  /* 拒绝：几何参数未标定（kin_scs_ready()==0） */
+#define PROTO_CART_UNREACHABLE   0x02u  /* 拒绝：目标超出可达斜距范围 */
+#define PROTO_CART_SING_BASE     0x03u  /* 已执行 · 底座奇异（目标在底座轴上，θ 沿用当前角） */
+#define PROTO_CART_SING_AXIS     0x04u  /* 拒绝：目标落在肩轴心上（d≈0，仰角 α 无定义） */
+#define PROTO_CART_LIMITED       0x05u  /* 已执行 · 解出的关节角被软限位钳位 */
+#define PROTO_CART_FAULT         0x06u  /* 拒绝：故障态 */
+#define PROTO_CART_BADLEN        0x07u  /* 拒绝：载荷长度不对 */
+
 /* 各消息的载荷长度（正本 §4.2~§4.7） */
 #define PROTO_LEN_STATUS       19u
 #define PROTO_LEN_TARGET       11u
