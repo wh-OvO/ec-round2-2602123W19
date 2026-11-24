@@ -12,7 +12,7 @@
 |---|---|
 | 工具名称 | **DeepSeek Harness（DSH）** —— 对话式编码代理（桌面端 Web GUI），通过工具调用直接读写仓库文件、执行构建与单元测试 |
 | 模型版本 | `deepseek-v4` 系列 |
-| 使用时段 | **2026-11-06 ～ 2026-11-13**（T0 起至 PID 模块） |
+| 使用时段 | **2026-11-06 ～ 2026-11-24**（T0 起，经 PID 模块、J1 坐标系标定，到 0x34 笛卡尔逆解） |
 | 使用方式 | 由本人提出需求与约束 → 代理生成代码/文档草案 → **本人在本机编译、烧录、实测并逐条核对** → 采用或退回修改 |
 | 未使用的方式 | 未使用代码补全插件（Copilot 等）自动补全；未使用 AI 生成整包工程后直接提交 |
 
@@ -65,6 +65,23 @@
 | 31 | 2026-11-13 | `Drivers/CMSIS/Lib/`（删除）、`.gitignore`、`README.md`、`AI.MD` | 按任务书 2.4.2 删除 5 个无源码预编译库（34.1 MB）；补本文件与 README | 是 | 从零全量构建 `exit=0`，FLASH 41096 B / 62.71% 与删除前一致 | `8699455` |
 | 32 | 2026-11-13~14 | `Core/Src/arm_cfg.c`、`Core/Inc/arm_cfg.h`、`docs/AS5600_零点标定_实操.md` | AS5600 零点标定起步：J1 `.kind` 切 `ARM_JOINT_VEL`、`.us_stop` 填 1500、`ARM_BASE_U_MAX_US` 300→50（SIGN 填反时只慢爬不飞车）；新增 5 步标定手册 + 4 类故障表 | 是 | 编译 `exit=0`；**标定本身未上板**，手册待本人照着做 | `45cac9e` |
 | 33 | 2026-11-14 | `AI.MD` | 回填第 31 / 32 条的提交哈希，并核对 `git log --grep="^AI:"` 与本文表格一一对应 | 是 | 本机核对：两条提交均能被 `git log --grep="^AI:"` 检索到 | **本条** |
+| 34 | 2026-11-20 | `arm_pid.c/h`、`arm_cfg.c/h`、`arm_joint.c`、`as5600.c`、`CMakeLists.txt`、`tests/pid_selftest.c`、`tests/pid_loop_sim.c` | 位置式 PID 模块（P/I/D + 前馈 + 死区 + 冻结式抗饱和 + D 一阶低通），接进底座闭环 | 是 | 编译 exit=0；`pid_selftest` 40/40、`pid_loop_sim` 8 组 exit=0；**未上板** | `c5773d4` |
+| 35 | 2026-11-20 | `main.c`、`arm_pwm.c`、`proto_app.c`、`mpu6050.c/h`、`.vscode/launch.json`、`rm_arm.ioc`、`docs/` | I²C1 400k→100k、上电脉宽按各关节零位、MPU6050 宽容/严格双模式、修 stlinkgdbtarget 属性名 | 是 | 编译 exit=0；本笔改动随 21:35 那次烧录一并上板（§8 2026-11-20 21:35） | `9c399de` |
+| 36 | 2026-11-20 | `docs/plan.md` | 把仓库外的 plan.md 快照收进版本库 | 是 | `git ls-files` 确认此前未被跟踪；两份内容一致 | `fe68b61` |
+| 37 | 2026-11-20 | `docs/plan.md` | 回填上三笔哈希，并把「19 项」更正为「18 个文件」 | 是 | 哈希逐条核对；两侧文件一致 | `ca179ce` |
+| 38 | 2026-11-20 | `arm_kin.c/h`、`arm_cfg.c/h`、`arm_joint.c`、`arm_pwm.c`、`proto_app.c`、`tests/kin_selftest.c` | 极坐标闭式逆解 + J1 坐标系改 0~360 | 是 | `kin_selftest` 22/22、`pid_selftest` 40/40；**已烧**（mode=UR + verify passed） | `1ec8715` |
+| 39 | 2026-11-20 | `docs/plan.md` | 记录「烧录必须 mode=UR」 | 是 | 当次 `STM32_Programmer_CLI` 实测输出 | `2abed10` |
+| 40 | 2026-11-20 | `arm_cfg.c/h`、`arm_joint.c`、`proto_app.c`、`docs/plan.md` | J1 上限 358→320（云台柱撞支撑板），偏移改成从标定表现算 | 是 | 撞点来自本人实测；**已烧**（§8 2026-11-20 23:50） | `95ac978` |
+| 41 | 2026-11-21 | `arm_cfg.c/h`、`arm_joint.c`、`proto_app.c`、`docs/plan.md` | J1 上限 320→312（撞点 315 内退 3°） | 是 | 撞点来自本人实测；**未烧**（板子没插） | `7c30de6` |
+| 42 | 2026-11-21 | `docs/plan.md` | 修正 08:55 那行的烧录状态为「未烧」 | 是 | 本人确认当次未插板 | `b7b6f6f` |
+| 43 | 2026-11-21 | `kin_scs.c/h`、`kin_ccs.c/h`、`tests/ccs_selftest.c`、`tests/scs_selftest.c`、`CMakeLists.txt` | 拆成球坐标（验收用）与笛卡尔（对照用）两个互不依赖的逆解库 | 是 | 编译 exit=0；`ccs_selftest` 24 条、175 点最大偏差 4.6e-5°；**未上板** | `2a1c525` |
+| 44 | 2026-11-23 | `arm_cfg.h`、`kin_scs.c`、`kin_ccs.c/h`、`tests/scs_selftest.c`、`tests/ccs_selftest.c` | 填本人尺量的 L1=43 / L2=105 mm 与 10°/20° 重力下垂 | 是 | `scs_selftest` 26 项、`ccs_selftest` 24 项全过；**未烧**（板子没插） | `5bdcccd` |
+| 45 | 2026-11-23 | `arm_cfg.h`、`kin_scs.c/h`、`kin_ccs.c/h`、两份 selftest | 改成「轴平面法向偏 10°/20°」闭式解 | **否**（当天 17:09 被本人推翻） | 数值推演 + 编译；**未烧** | `7cdd898` |
+| 46 | 2026-11-23 | `arm_cfg.h`、`kin_scs.c/h`、`kin_ccs.c/h`、两份 selftest | 撤销上一条，回到平面两连杆 + 固定角度偏置 | 是 | `ccs_selftest` 16/16（两库正解逐点差 0.000000 mm）；**未烧** | `8eebf83` |
+| 47 | 2026-11-24 | `arm_cfg.h`、`arm_cfg.c`、`arm_joint.c` | J1 回 ±180、加 `ARM_BASE_DEG_SCALE` 1.3333、ZERO 182.0、J2 下限 30 | 是 | 编译 exit=0；SCALE 来自本人实测（上位机 90° 实转 120°）；**该比例未单独上板复验** | `67f12b3` |
+| 48 | 2026-11-24 | `proto_app.c/h`、`proto.h`、`kin_c2s.c/h`、`kin_scs.c/h`、`tests/cart_chain_selftest.c`、`tests/c2s_selftest.c`、`CMakeLists.txt` | 接入 0x34 笛卡尔逆解三段链路，不可达/底座奇异/肩轴奇异/越限四类独立应答 | 是 | 编译 exit=0；`cart_chain_selftest` 1622/1622（<0.05 mm）、`c2s_selftest` 53、`scs_selftest` 33；**未上板** | `cdc05d6` |
+| 49 | 2026-11-24 | `proto_app.c`、`docs/plan.md` | 回填 0x34 两笔提交号与烧录结果，重写时间参数块注释 | 是 | 烧录 `Download verified successfully`（43.67 KB）；注释改动逐条数过 6 个常量、值未变 | `455c5ca` |
+| 50 | 2026-11-24 | `docs/plan.md` | 定位「全都不会动」为上位机把整帧当载荷重套一层（BADLEN） | 是 | 界面 CRC8=0x71 与按 `A5 34 0D` + 13 字节重算一致；固件无需改动 | `fb75180` |
 
 ---
 
@@ -105,3 +122,30 @@
 - 自 2026-11-13 起的提交，message 末尾一律带 `AI:` / `Verified:` 两行；
 - **未改写历史**：为保持提交历史的真实性（任务书 5.1.3 要求"保留真实的提交历史"），
   不对既有提交做 amend / rebase / force-push，旧提交的哈希与内容保持原样。
+
+### 关于 2026-11-20 ～ 11-24 这 17 条提交（2026-11-24 补记）
+
+这 17 条提交当初**没有**带 `AI:` / `Verified:` 尾行 —— 11-14 那三条之后，标注流程就断了，
+`git log --grep="^AI:"` 只能捞到 3 条。2026-11-24 经本人要求补记：
+
+- **做法**：`git commit-tree` 逐条重建 message，再用 `git update-ref`（带旧值做 CAS）一次性切换分支。
+  **只加尾行**，不改任何文件内容 —— 每个提交的 tree 与改写前**逐字节相同**
+  （`git diff pre-trailer-backup HEAD` 为空），作者、提交者与两个时间戳全部保留。
+- **旧历史**：改写前的 HEAD `0bf5680` 保留在 tag `pre-trailer-backup`，可随时 `git show` 回溯。
+- **哈希变了**：17 个短哈希全部不同。下表是改写前后的对照，
+  `plan.md` 与之配套的 `docs/plan.md`、`docs/接线与实物数据流.md` 里引用旧哈希的地方已同步替换。
+
+| 改写前 | 改写后 | 改写前 | 改写后 |
+|---|---|---|---|
+| `19f7a4d` | `c5773d4` | `8b51bdb` | `2a1c525` |
+| `b0ebb81` | `9c399de` | `5fc4ef2` | `5bdcccd` |
+| `83308e6` | `fe68b61` | `0dba5a8` | `7cdd898` |
+| `894b037` | `ca179ce` | `71869f6` | `8eebf83` |
+| `a49bd23` | `1ec8715` | `bfcf998` | `67f12b3` |
+| `191e84a` | `2abed10` | `bdab27e` | `cdc05d6` |
+| `8b39b0f` | `95ac978` | `c8d38fd` | `455c5ca` |
+| `5b230bb` | `7c30de6` | `0bf5680` | `fb75180` |
+| `f228d91` | `b7b6f6f` | — | — |
+
+- **补记之后**：`git log --grep="^AI:"` 命中 **20** 条（3 条 11-14 原有 + 17 条本次补记），
+  总提交数仍是 49 条。此后每一笔提交都必须在 message 末尾带 `AI:` / `Verified:` 两行。
