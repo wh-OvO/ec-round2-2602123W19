@@ -131,8 +131,17 @@ const arm_joint_cfg_t g_arm_joint[ARM_JOINT_NUM] =
     .name           = "J1 底座",
     .kind           = ARM_JOINT_VEL,   /* 2026-11-13 起：编码器闭环 */
     .deg_min        = -180,
-    .deg_max        = 135,
+    .deg_max        = 145,
     .deg_home       = 0,
+
+  /* ⚠️ 2026-11-24 17:0x 用户要求：deg_max 135 → **145**（他记不清当初填的是
+   *   135 还是 145，确认是 135 后让改成 145）。
+   *
+   *   注意 145 这一改，arm_joint.c 里的 CENTER 跟着变了：
+   *       CENTER = (deg_min + deg_max)/2 = (−180 + 145)/2 = **−17.5**（原 −22.5）
+   *   也就是**所有底座读数整体 +5°**。要保住原来那个"home 读 0"的标定，
+   *   ARM_BASE_ENC_ZERO_DEG 得从 182.0 跟着改成 **178.25**（推导见 arm_cfg.h）。
+   *   这次没动 ZERO —— 那是编码器标定链上的数，等用户定了再一起改。 */
     .us_at_deg_min  = 600,      /* ← 标定后改这里 */
     .us_at_deg_max  = 2400,     /* ← 标定后改这里 */
     .us_stop        = 1500,     /* 实测停转点（自带死区 1490~1520）。仅 VEL 用 */
