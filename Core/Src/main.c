@@ -28,6 +28,7 @@
 #include "arm_cfg.h"       /* T1: 标定表 g_arm_joint[] 与时基宏 */
 #include "mpu6050.h"       /* T4: MPU6050 姿态传感器（I²C1，400kHz） */
 #include "proto_app.h"     /* T5a: proto_app_init() / proto_app_poll() */
+#include "usbd_cdc_if.h"   /* 逃课日志：按住 PA0 上电，CDC 直接输出文本（见 usb_log_mode） */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -77,6 +78,9 @@ static void MX_USART1_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/* 定义在 usb_device.c（CubeMX 生成），这里只声明 */
+extern USBD_HandleTypeDef hUsbDeviceFS;
 
 /* I²C1 目标速率 = 400 kHz（任务书 T4 明确要求，且 .ioc 里也是 Fast Mode）。
  * 2026-11-15 曾因 15~20cm 杜邦线偶发 NACK 降到 100 kHz；2026-11-25 用户决定按任务书
@@ -313,6 +317,66 @@ static void t0_loop(void)
   }
 }
 
+/* ---------------- “没有 USB-TTL”时的文本日志逃课模式 ----------------
+ * 进入：按住 PA0 再上电/复位。USB CDC 不跑协议，直接输出人可读文本，
+ *       用任意串口助手打开“USB 串行设备”对应的 COM 就能看（波特率随便填）。
+ * 退出：松开按键再复位一次，恢复正常的二进制协议。
+ *
+ * 为什么不把日志混进正常模式：CDC 是上位机的协议字节流，混文本会让按 0xA5
+ * 同步的上位机收到脏字节（见文件头“日志只走 USART1”的说明）。所以单独开一个
+ * 上电窗口，鱼和熊掌分开。
+ *
+ * 主机 5 秒内没枚举成功就直接返回、照常启动 —— 避免“按住键就卡死”。 */
+static void cdc_write_text(const char *s, int n)
+{
+  uint32_t t0;
+
+  if (n <= 0) { return; }
+  t0 = HAL_GetTick();
+  while (CDC_Transmit_FS((uint8_t *)s, (uint16_t)n) != USBD_OK)
+  {
+    if ((HAL_GetTick() - t0) > 20u) { return; }   /* 主机没在读，丢掉这一行 */
+    HAL_Delay(1u);
+  }
+}
+
+static void usb_log_mode(void)
+{
+  char line[256];
+  uint32_t t_wait;
+  int n;
+
+  t_wait = HAL_GetTick();
+  while ((HAL_GetTick() - t_wait) < 5000u)
+  {
+    if (hUsbDeviceFS.dev_state == USBD_STATE_CONFIGURED) { break; }
+    HAL_Delay(10u);
+  }
+  if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) { return; }
+
+  /* 只做一次探测，后面每行打印结果 */
+  (void)mpu6050_init();
+
+  /* 全 ASCII：串口助手默认多是 GBK，发 UTF-8 中文会变乱码 */
+  n = snprintf(line, sizeof line,
+               "\r\n[USB-LOG] text debug mode (hold PA0 during reset)\r\n"
+               "Open the 'USB Serial Device' COM port, any baud rate.\r\n"
+               "Release the key and reset -> back to binary protocol.\r\n");
+  cdc_write_text(line, n);
+
+  while (1)
+  {
+    n = snprintf(line, sizeof line,
+                 "[%8lu ms] LED=%s  MPU6050=%s\r\n",
+                 (unsigned long)HAL_GetTick(),
+                 (HAL_GPIO_ReadPin(LED_GPIO_Port, LED_Pin) == GPIO_PIN_RESET) ? "ON " : "OFF",
+                 (mpu6050_present() != 0u) ? "yes" : "no");
+    cdc_write_text(line, n);
+    HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+    HAL_Delay(500u);
+  }
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -350,6 +414,11 @@ int main(void)
   MX_USART1_UART_Init();
   MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
+  /* 逃课：复位时按住 PA0 -> CDC 输出文本日志；正常上电不进入 */
+  if (HAL_GPIO_ReadPin(KEY_GPIO_Port, KEY_Pin) == GPIO_PIN_SET)
+  {
+    usb_log_mode();
+  }
   t0_setup();
   proto_app_init();          /* T5a: 协议层就绪（先 arm_init 再初始化协议，顺序不能反） */
   /* USER CODE END 2 */
