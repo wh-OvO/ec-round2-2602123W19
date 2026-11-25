@@ -78,10 +78,11 @@ static void MX_USART1_UART_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/* I²C1 目标速率。T4 的判据写的是 400kHz；本工程因杜邦线长/上拉弱
- * 实测 400kHz 偶发 NACK，定为 100kHz（plan.md §8 2026-11-15 19:45）。
- * 改回 400kHz 只动这一个宏 —— 生成区保持 CubeMX 原样，见 MX_I2C1_Init 的 USER CODE 2。 */
-#define ARM_I2C1_CLOCK_HZ   100000u
+/* I²C1 目标速率 = 400 kHz（任务书 T4 明确要求，且 .ioc 里也是 Fast Mode）。
+ * 2026-11-15 曾因 15~20cm 杜邦线偶发 NACK 降到 100 kHz；2026-11-25 用户决定按任务书
+ * 回到 400 kHz（长线是已知风险，后续用短排线/加大上拉解决，不靠降速掩盖）。
+ * 只动这一个宏 —— 生成区保持 CubeMX 原样，见 MX_I2C1_Init 的 USER CODE 2。 */
+#define ARM_I2C1_CLOCK_HZ   400000u
 
 /* ---------------- 日志输出：**只走 USART1** ----------------
  * ⚠️ 绝对不要把日志写进 USB CDC。
@@ -210,7 +211,7 @@ static void print_banner(void)
   if (mpu6050_present() != 0u)
   {
     /* 不写死 WHO_AM_I=0x68：probe 接受 0x68/0x70/0x71 三种克隆片。
-     * 速率也按宏打印 —— 原来写“400kHz”而实际跑 100kHz，是自相矛盾的证据。 */
+     * 速率按宏打印，和实际重配值永远一致（不要再手写死数字）。 */
     printf("[T4] MPU6050 在线 (±2g/±500dps, 50Hz, I2C1 %ukHz)\r\n",
            (unsigned)(ARM_I2C1_CLOCK_HZ / 1000u));
   }
@@ -223,7 +224,7 @@ static void print_banner(void)
 /* ---------------- T0 上电自检 ---------------- */
 static void t0_setup(void)
 {
-  /* LED 先灭（野火板 PA1 = LED_R，低电平点亮） */
+  /* LED 先灭（Blue Pill：PA1 外接 LED，低电平点亮） */
   HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
 
   setvbuf(stdout, NULL, _IONBF, 0);   /* 关掉缓冲，插上串口就能看到 */
@@ -236,7 +237,7 @@ static void t0_setup(void)
   arm_joint_init();
 
   /* T4 姿态传感器：探测 MPU6050（WHO_AM_I 接受 0x68/0x70/0x71）+ 配量程/滤波/采样率。
-   * 此时 MX_I2C1_Init() 已经跑过，I2C1 是 ARM_I2C1_CLOCK_HZ（当前 100kHz）。
+   * 此时 MX_I2C1_Init() 已经跑过，I2C1 是 ARM_I2C1_CLOCK_HZ（当前 400kHz）。
    * 内部有约 110ms 的软复位等待，只在启动时做一次。 */
   (void)mpu6050_init();
 
@@ -442,10 +443,10 @@ static void MX_I2C1_Init(void)
   }
   /* USER CODE BEGIN I2C1_Init 2 */
 
-  /* ★ 2026-11-24：降速覆盖从**生成区**挪到这里（原来直接改上面那行 400000→100000）。
-   * 两个原因：① 任务书 2.4.5 禁止改 CubeMX 生成区；② .ioc 仍是 Fast/400kHz，
-   * 重新 GENERATE 会把生成区改回 400000，代码与工程文件长期互相矛盾。
-   * 现在生成区保持原样，这里按 ARM_I2C1_CLOCK_HZ 重配一次。 */
+  /* ★ 2026-11-24：速率覆盖从**生成区**挪到这里（原来直接改上面那行 400000→100000）。
+   * 两个原因：① 任务书 2.4.5 禁止改 CubeMX 生成区；② 速率只留一个权威来源。
+   * 2026-11-25 宏已改回 400000（与 .ioc 的 Fast Mode 一致），这里仍按宏重配一次，
+   * 以后调速率只动 ARM_I2C1_CLOCK_HZ，生成区永远保持 CubeMX 原样。 */
   hi2c1.Init.ClockSpeed = ARM_I2C1_CLOCK_HZ;
   if (HAL_I2C_Init(&hi2c1) != HAL_OK)
   {
