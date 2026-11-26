@@ -30,15 +30,13 @@ extern TIM_HandleTypeDef htim2;
 
 /* 关节编号 → TIM2 通道。顺序必须和 g_arm_joint[] / 引脚表一致。
  *
- * ★ 2026-11-11 换野火板后：TIM2 做了**全重映射**，通道号没变，只是从
- *   哪根脚出来变了。重映射本身在 main.c 的 MX_GPIO_Init() 里写：
- *       __HAL_AFIO_REMAP_TIM2_ENABLE();
+ * TIM2 走**全重映射**（main.c 的 MX_GPIO_Init() 里写
+ * __HAL_AFIO_REMAP_TIM2_ENABLE()），通道号不变，只是出脚变了：
  *
  *     J1 TIM2_CH1 → PA15      J2 TIM2_CH2 → PB3
  *     J3 TIM2_CH3 → PB10      J4 TIM2_CH4 → PB11
  *
- *   原来 Blue Pill 上是 PA0/PA1/PA2/PA3，现在野火板那四个脚是
- *   KEY1 按键和 LED_R/G/B，不能再用。 */
+ * PA0/PA1 是按键和 LED，不能用；改脚必须同步改这里和 arm_cfg.c 的对照表。 */
 static const uint32_t s_channel[ARM_JOINT_NUM] =
 {
   TIM_CHANNEL_1,   /* J1 → PA15（全重映射） */
@@ -59,16 +57,16 @@ static void arm_write_ccr(uint8_t joint, uint16_t ccr)
 /* 上电第一拍该给多少 µs                                                      */
 /* ------------------------------------------------------------------------- */
 
-/* ★ 为什么速度型关节不能按 deg_home 反算（2026-11-20 加）：
+/* ★ 为什么速度型关节不能按 deg_home 反算：
  *
- *   J1 是 360° 连续旋转舵机，**没有"开环角度"这回事** —— `arm_deg_to_us()`
- *   只是拿标定表对 (deg_min..deg_max) 做线性插值。J1 的 deg_home 现在等于
- *   deg_min = 2，插值结果就是 us_at_deg_min = **600µs = 满速**。上电第一拍
- *   给满速，底座会窜一下，等 5ms 后的闭环（vel_tick）才抓得住。
+ *   J1 是 360° 连续旋转舵机，没有“开环角度”这回事 —— `arm_deg_to_us()`
+ *   只是拿标定表对 (deg_min..deg_max) 做线性插值。J1 的 deg_home = 0
+ *   落在区间中间，插值出来是一个**非零转速**：上电第一拍就会转，
+ *   等 5ms 后的 vel_tick() 才抓得住。
  *
- *   速度型关节的正确上电状态是「停转」：给 us_stop，剩下的交给闭环去追
- *   deg_home。注意 5ms 后 vel_tick() 就会把目标拉到 deg_home，所以"上电
- *   自动回零"这个行为**没有变**，变的只是第一拍不再满速。 */
+ *   速度型关节的正确上电状态是“停转”：给 us_stop，剩下的交给闭环去追
+ *   deg_home。5ms 后 vel_tick() 会把目标拉到 deg_home，所以“上电自动回零”
+ *   这个行为没有变，变的只是第一拍不再窜出去。 */
 static uint16_t power_on_us(uint8_t j)
 {
   if (g_arm_joint[j].kind == ARM_JOINT_VEL)
@@ -90,18 +88,13 @@ void arm_init(void)
    * 否则通道一启动就会按寄存器里的旧值（可能是 0）输出一小段，
    * 舵机会抖一下甚至冲向极限。
    *
-   * ★★ 重点看这里（2026-11-15 改）★★
-   *   原来这里四路统一写 SERVO_US_HOME(1500)。但**每个关节的零位不一定是
-   *   1500µs** —— J4 夹爪标定下来零位是 1480µs（见 arm_cfg.c）。
-   *   于是上电瞬间：第 1 拍给 1500 → 夹爪被拉到 ≈84°，
-   *                 第 3 步再给 1480 → 又弹回 60°。
-   *   肉眼看就是"上电抽一下"，带载时还会顶一下工件。
+   * 为什么不能四路统一写 1500：每个关节的零位不一定是 1500µs ——
+   * J4 夹爪零位是 1480µs（见 arm_cfg.c）。统一写 1500 的话，
+   * 上电瞬间夹爪先被拉到 ≈84°，再弹回 60°，肉眼就是“上电抽一下”，
+   * 带载还会顶一下工件。
    *
-   *   改成：按各自标定表的 deg_home 反算脉宽，**第一拍就是正确的**。
-   *   注意必须放在 HAL_TIM_PWM_Start() 之前 —— 这一步的时序意义没变。
-   *
-   * ★★ 2026-11-20 再改：位置型还是按 deg_home 反算，速度型改给 us_stop。
-   *   原因见上面 power_on_us() 的注释（J1 新零位 2° 会反算出 600µs 满速）。 */
+   * 所以按 power_on_us() 逐关节给：位置型按 deg_home 反算，第一拍就是
+   * 正确位置；速度型给 us_stop，第一拍不转（理由见 power_on_us()）。 */
   for (j = 0; j < ARM_JOINT_NUM; j++)
   {
     arm_write_ccr(j/*#语法糖标签#*/, ARM_PWM_US_TO_CCR(power_on_us(j)));

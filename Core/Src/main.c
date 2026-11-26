@@ -82,9 +82,8 @@ static void MX_USART1_UART_Init(void);
 /* 定义在 usb_device.c（CubeMX 生成），这里只声明 */
 extern USBD_HandleTypeDef hUsbDeviceFS;
 
-/* I²C1 目标速率 = 400 kHz（任务书 T4 明确要求，且 .ioc 里也是 Fast Mode）。
- * 2026-11-15 曾因 15~20cm 杜邦线偶发 NACK 降到 100 kHz；2026-11-25 用户决定按任务书
- * 回到 400 kHz（长线是已知风险，后续用短排线/加大上拉解决，不靠降速掩盖）。
+/* I²C1 速率 = 400 kHz（任务书 T4 要求，.ioc 里也是 Fast Mode）。
+ * 15~20cm 长杜邦线偶发 NACK 是已知风险：靠短排线/加大上拉解决，不靠降速掩盖。
  * 只动这一个宏 —— 生成区保持 CubeMX 原样，见 MX_I2C1_Init 的 USER CODE 2。 */
 #define ARM_I2C1_CLOCK_HZ   400000u
 
@@ -296,9 +295,7 @@ static void t0_loop(void)
 
   /* T0 原文：「LED 以 1Hz 闪烁，按键能翻转 LED 状态」。
    * 1Hz = 每 500ms 翻转一次；按键翻转叠加在闪烁之上并重置计时，
-   * 按下的瞬间一定看得到变化，不会被下一拍闪回去。
-   * ★ 2026-11-24 补：此前这里只有按键翻转、没有周期翻转，
-   *   而 README / AI.MD 都写着“LED 1Hz 闪烁”—— 属于记录不实，一并纠正。 */
+   * 按下的瞬间一定看得到变化，不会被下一拍闪回去。 */
   if ((HAL_GetTick() - t_blink) >= 500u)
   {
     t_blink = HAL_GetTick();
@@ -512,10 +509,8 @@ static void MX_I2C1_Init(void)
   }
   /* USER CODE BEGIN I2C1_Init 2 */
 
-  /* ★ 2026-11-24：速率覆盖从**生成区**挪到这里（原来直接改上面那行 400000→100000）。
-   * 两个原因：① 任务书 2.4.5 禁止改 CubeMX 生成区；② 速率只留一个权威来源。
-   * 2026-11-25 宏已改回 400000（与 .ioc 的 Fast Mode 一致），这里仍按宏重配一次，
-   * 以后调速率只动 ARM_I2C1_CLOCK_HZ，生成区永远保持 CubeMX 原样。 */
+  /* 速率在生成区之后按宏重配一次：生成区必须保持 CubeMX 原样（任务书 2.4.5），
+   * 而速率只留 ARM_I2C1_CLOCK_HZ 一个权威来源。改速率只动那个宏。 */
   hi2c1.Init.ClockSpeed = ARM_I2C1_CLOCK_HZ;
   if (HAL_I2C_Init(&hi2c1) != HAL_OK)
   {
@@ -537,14 +532,13 @@ static void MX_TIM2_Init(void)
   /* USER CODE BEGIN TIM2_Init 0 */
   /* ★ 四个通道**全部**必须是 PWM Generation 模式。
    *
-   *   2026-11-11 换板那一次，CubeMX 里 TIM2_CH2 被误设成 "Forced Output CH2"，
-   *   于是通道 2 不再是 PWM，而是**恒定高电平**：
-   *     - PB3（J2 大臂）一直 3.3V，万用表读 3.3V 而不是 0.25V
-   *     - CCR 写了也没用（强制输出忽略比较值，J2 完全不听指令）
-   *   症状特别像"重映射没生效"，但重映射其实是好的，别去乱改 AFIO。
+   * 若某一路被设成 "Forced Output CHx"，它就不再是 PWM，而是**恒定高电平**：
+   *   - 对应脚一直 3.3V，万用表读 3.3V 而不是约 0.25V
+   *   - CCR 写了也没用（强制输出忽略比较值，该关节完全不听指令）
+   * 症状很像“重映射没生效”，但重映射可能是好的，先查这里和 .ioc。
    *
-   *   判据：万用表量 PB3 恒 3.3V（另外三路正常）→ 先回来查这里和 .ioc。
-   *   rm_arm.ioc 已同步改回 PWM Generation2，重新 GENERATE CODE 不会复发。 */
+   * 判据：量某一路恒 3.3V（另外三路正常）→ 先查 TIM2 通道模式。
+   * rm_arm.ioc 已同步为 PWM Generation，重新 GENERATE CODE 不会复发。 */
   /* USER CODE END TIM2_Init 0 */
 
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
@@ -694,7 +688,7 @@ static void MX_GPIO_Init(void)
   GPIO_InitTypeDef GPIO_InitStruct = {0};
 /* USER CODE BEGIN MX_GPIO_Init_1 */
   /* ======================================================================
-   * ★★★ 换野火 F103C8T6 核心板必看：TIM2 全重映射 + 关 JTAG 留 SWD ★★★
+   * ★★★ TIM2 全重映射 + 关 JTAG 留 SWD ★★★
    *
    * 【为什么这两行必须手写】
    *   CubeMX 对 STM32F1 的定时器重映射**只生成引脚 AF 配置**，不生成
@@ -703,8 +697,8 @@ static void MX_GPIO_Init(void)
    *   但全项目搜不到 REMAP_TIM2。
    *
    *   只配 AF、不改 MAPR 会怎样？信号仍旧从 PA0/PA1/PA2/PA3 出来。
-   *   而野火板上那四个脚是 KEY1 按键和 LED_R/G/B —— 结果是四路舵机一动不动，
-   *   按一下 KEY1 还等于把 3V3 短接到一个正在输出低电平的 PWM 脚上。
+   *   而当前板 PA0/PA1 是按键和 LED —— 结果是四路舵机一动不动，
+   *   按一下按键还等于把 3V3 短接到一个正在输出低电平的 PWM 脚上。
    *
    * 【两行分别做什么】
    *   __HAL_AFIO_REMAP_SWJ_NOJTAG() → SWJ_CFG = 001：关掉 JTAG，保留 SWD。
@@ -717,7 +711,6 @@ static void MX_GPIO_Init(void)
    *   AFIO 的 RCC 时钟在 HAL_MspInit() 里已经开了（stm32f1xx_hal_msp.c:73），
    *   而 HAL_Init() 早于 MX_GPIO_Init()，所以这里可以直接写 AFIO->MAPR。
    *
-   * 【改动历史】2026-11-11 从 Blue Pill 迁到野火板时加的。
    * ====================================================================== */
   __HAL_AFIO_REMAP_SWJ_NOJTAG();
   __HAL_AFIO_REMAP_TIM2_ENABLE();
